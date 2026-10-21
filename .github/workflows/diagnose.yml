@@ -70,6 +70,9 @@ jobs:
         run: |
           go version
           go test ./pkg/jsruntime -run "TestNodeCoreModulesAndECMAScriptBuiltins|TestStorageDirIsConfinedAdditionalRoot" -count=1 -v || true
+      - name: Filesystem module diag
+        run: |
+          go test ./pkg/jsruntime/fs -run TestDiagRootWrite -count=1 -v || true
 
   upstream-main:
     runs-on: ubuntu-latest
