@@ -701,13 +701,22 @@ func fsMode(value goja.Value, fallback os.FileMode) os.FileMode {
 			return fallback
 		}
 	}
-	if text, ok := value.Export().(string); ok {
-		mode, err := strconv.ParseUint(text, 8, 32)
-		if err == nil {
-			return os.FileMode(mode)
+	// Node allows fs.writeFileSync(path, data, "utf8") where the third
+	// argument is an encoding rather than an options object. Treating such a
+	// string as a mode would create the file with permission 000 on Unix,
+	// making every later read fail with EACCES, so unparsable values fall
+	// back to the default mode instead.
+	switch exported := value.Export().(type) {
+	case string:
+		mode, err := strconv.ParseUint(exported, 8, 32)
+		if err != nil {
+			return fallback
 		}
+		return os.FileMode(mode)
+	case int64, int32, int, float64:
+		return os.FileMode(value.ToInteger())
 	}
-	return os.FileMode(value.ToInteger())
+	return fallback
 }
 
 func fsAccessMode(value goja.Value) int {
