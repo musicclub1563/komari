@@ -13,9 +13,13 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  GO_VERSION: "1.27.3"
+  ZIG_VERSION: "0.14.1"
 
+# Only the newest main commit is worth publishing: a newer push cancels an
+# older snapshot run instead of queueing a stale one.
 concurrency:
-  group: snapshot-${{ github.ref }}
+  group: snapshot-main
   cancel-in-progress: true
 
 jobs:
@@ -71,8 +75,37 @@ jobs:
         with:
           artifact-name: komari-frontend
 
+  # Modules are downloaded once; the matrix jobs restore the same key instead of
+  # all eight racing to save it.
+  go-modules:
+    needs: validate-ref
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Restore Go module cache
+        id: go-mod-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-${{ runner.os }}-go${{ env.GO_VERSION }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            go-mod-${{ runner.os }}-go${{ env.GO_VERSION }}-
+
+      - name: Download Go modules
+        if: steps.go-mod-cache.outputs.cache-hit != 'true'
+        run: go mod download
+
   build-and-attach-binaries:
-    needs: [prepare, build-frontend]
+    needs: [prepare, build-frontend, go-modules]
     runs-on: ubuntu-latest
 
     strategy:
@@ -131,10 +164,23 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.27.3"
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
 
       - name: Install Zig cross-compiler toolchain
         uses: ./.github/actions/setup-zig
+        with:
+          zig-version: ${{ env.ZIG_VERSION }}
+
+      - name: Restore Go caches
+        id: go-cache
+        uses: ./.github/actions/go-cache
+        with:
+          mode: restore
+          go-version: ${{ env.GO_VERSION }}
+          zig-version: ${{ env.ZIG_VERSION }}
+          goos: ${{ matrix.goos }}
+          goarch: ${{ matrix.goarch }}
 
       - name: Build binary
         env:
@@ -155,6 +201,16 @@ jobs:
             LDFLAGS="$LDFLAGS -extldflags=-Wl,--strip-all"
           fi
           go build -trimpath -ldflags="$LDFLAGS" -o "$BINARY_NAME"
+
+      - name: Save Go build cache
+        if: steps.go-cache.outputs.build-cache-hit != 'true'
+        uses: ./.github/actions/go-cache
+        with:
+          mode: save
+          go-version: ${{ env.GO_VERSION }}
+          zig-version: ${{ env.ZIG_VERSION }}
+          goos: ${{ matrix.goos }}
+          goarch: ${{ matrix.goarch }}
 
       - name: Upload binary as artifact
         uses: actions/upload-artifact@v4
@@ -293,5 +349,10 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          no-cache: true
+          # Layer cache only. The COPY layer is keyed on the binary content, so a
+          # new snapshot still invalidates it, while `pull: true` keeps the
+          # Alpine base image current.
+          pull: true
+          cache-from: type=gha,scope=komari-snapshot
+          cache-to: type=gha,mode=max,scope=komari-snapshot
           provenance: false

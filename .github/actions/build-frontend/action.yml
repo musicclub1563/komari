@@ -17,6 +17,14 @@ inputs:
     description: Optional artifact name for the packed frontend theme.
     default: ""
 
+outputs:
+  commit:
+    description: The resolved komari-web commit SHA that produced the theme.
+    value: ${{ steps.frontend.outputs.sha }}
+  cache-hit:
+    description: Whether the packed theme was restored from cache.
+    value: ${{ steps.theme-cache.outputs.cache-hit }}
+
 runs:
   using: composite
   steps:
@@ -40,7 +48,44 @@ runs:
           exit 1
         fi
 
+    - name: Resolve frontend commit
+      id: frontend
+      shell: bash
+      env:
+        # Single source of truth for the verified komari-web commit. Keeping it
+        # here means an empty ref still builds the pinned frontend instead of
+        # falling back to the repository default branch.
+        PINNED_REF: "2675059ce88979630633527f6e42774c1dabb006"
+        INPUT_REF: ${{ inputs.ref }}
+        REPO: ${{ inputs.repository }}
+      run: |
+        set -euxo pipefail
+        ref="${INPUT_REF:-$PINNED_REF}"
+        if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+          sha="$ref"
+        else
+          sha="$(git ls-remote "$REPO" "$ref" | head -n1 | cut -f1)"
+          if [ -z "$sha" ]; then
+            echo "Unable to resolve komari-web ref '$ref' in $REPO" >&2
+            exit 1
+          fi
+        fi
+        echo "ref=$ref" >> "$GITHUB_OUTPUT"
+        echo "sha=$sha" >> "$GITHUB_OUTPUT"
+        echo "Resolved komari-web ref $ref -> $sha"
+
+    - name: Restore packed theme cache
+      id: theme-cache
+      uses: actions/cache/restore@v4
+      with:
+        path: web/public/defaultTheme
+        # The key covers the frontend commit, the Node toolchain, and the action
+        # definition (clone/pack logic), so a changed theme input never reuses an
+        # older theme.
+        key: komari-frontend-${{ runner.os }}-${{ steps.frontend.outputs.sha }}-node${{ inputs.node-version }}-${{ hashFiles('.github/actions/build-frontend/action.yml') }}
+
     - name: Install zstd
+      if: steps.theme-cache.outputs.cache-hit != 'true'
       shell: bash
       run: |
         set -euxo pipefail
@@ -49,40 +94,43 @@ runs:
           sudo apt-get install -y zstd
         fi
 
-    - name: Clone and build frontend
+    - name: Clone frontend
+      if: steps.theme-cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        REPO: ${{ inputs.repository }}
+        SHA: ${{ steps.frontend.outputs.sha }}
+      run: |
+        set -euxo pipefail
+        rm -rf komari-web
+        # Pinned refs are commit SHAs, which `git clone --branch` cannot check
+        # out, so fetch the exact commit and verify it afterwards.
+        git init -q komari-web
+        git -C komari-web remote add origin "$REPO"
+        git -C komari-web fetch --depth=1 origin "$SHA"
+        git -C komari-web checkout -q --detach FETCH_HEAD
+        resolved_sha="$(git -C komari-web rev-parse HEAD)"
+        echo "komari-web commit: $resolved_sha"
+        if [ "$resolved_sha" != "$SHA" ]; then
+          echo "komari-web ref mismatch: expected $SHA but checked out $resolved_sha" >&2
+          exit 1
+        fi
+
+    - name: Restore npm download cache
+      if: steps.theme-cache.outputs.cache-hit != 'true'
+      uses: actions/cache@v4
+      with:
+        path: ~/.npm/_cacache
+        key: npm-${{ runner.os }}-node${{ inputs.node-version }}-${{ hashFiles('komari-web/package-lock.json') }}
+        restore-keys: |
+          npm-${{ runner.os }}-node${{ inputs.node-version }}-
+
+    - name: Install dependencies and build theme
+      if: steps.theme-cache.outputs.cache-hit != 'true'
       shell: bash
       run: |
         set -euxo pipefail
-        REPO="${{ inputs.repository }}"
-        # Single source of truth for the verified komari-web commit. Keeping it
-        # here means an empty ref still builds the pinned frontend instead of
-        # falling back to the repository default branch.
-        PINNED_REF="2675059ce88979630633527f6e42774c1dabb006"
-        REF="${{ inputs.ref }}"
-        REF="${REF:-$PINNED_REF}"
-        rm -rf komari-web
-        if [ -n "$REF" ]; then
-          # Pinned refs are usually commit SHAs, which `git clone --branch`
-          # cannot check out. Fetch the ref explicitly and fall back to a
-          # branch/tag clone when the server refuses a direct SHA fetch.
-          git init -q komari-web
-          git -C komari-web remote add origin "$REPO"
-          if git -C komari-web fetch --depth=1 origin "$REF"; then
-            git -C komari-web checkout -q --detach FETCH_HEAD
-          else
-            rm -rf komari-web
-            git clone --depth=1 --branch "$REF" "$REPO" komari-web
-          fi
-        else
-          git clone --depth=1 "$REPO" komari-web
-        fi
         cd komari-web
-        resolved_sha=$(git rev-parse HEAD)
-        echo "komari-web commit: $resolved_sha"
-        if [[ "$REF" =~ ^[0-9a-f]{40}$ ]] && [ "$resolved_sha" != "$REF" ]; then
-          echo "komari-web ref mismatch: expected $REF but checked out $resolved_sha" >&2
-          exit 1
-        fi
         if [ -f package-lock.json ]; then npm ci; else npm install; fi
         npm run build
         cd ..
@@ -98,6 +146,22 @@ runs:
         if [ -f komari-web/perview.png ]; then cp -f komari-web/perview.png web/public/defaultTheme/; fi
         if [ -f web/public/defaultTheme/preview.png ] && [ ! -f web/public/defaultTheme/perview.png ]; then cp -f web/public/defaultTheme/preview.png web/public/defaultTheme/perview.png; fi
         if [ -f web/public/defaultTheme/perview.png ] && [ ! -f web/public/defaultTheme/preview.png ]; then cp -f web/public/defaultTheme/perview.png web/public/defaultTheme/preview.png; fi
+
+    - name: Validate restored theme
+      if: steps.theme-cache.outputs.cache-hit == 'true'
+      shell: bash
+      run: |
+        set -euxo pipefail
+        test -s web/public/defaultTheme/dist.tar.zst
+        test -s web/public/defaultTheme/komari-theme.json
+        echo "Restored packed theme from cache (frontend commit ${{ steps.frontend.outputs.sha }})"
+
+    - name: Save packed theme cache
+      if: steps.theme-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: web/public/defaultTheme
+        key: komari-frontend-${{ runner.os }}-${{ steps.frontend.outputs.sha }}-node${{ inputs.node-version }}-${{ hashFiles('.github/actions/build-frontend/action.yml') }}
 
     - name: Pack frontend artifact
       if: ${{ inputs.artifact-name != '' }}

@@ -9,6 +9,8 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  GO_VERSION: "1.27.3"
+  ZIG_VERSION: "0.14.1"
 
 jobs:
   build-frontend:
@@ -37,10 +39,33 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.27.3"
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
 
       - name: Install Zig
         uses: ./.github/actions/setup-zig
+        with:
+          zig-version: ${{ env.ZIG_VERSION }}
+
+      - name: Restore Go caches (amd64)
+        id: go-cache-amd64
+        uses: ./.github/actions/go-cache
+        with:
+          mode: restore
+          go-version: ${{ env.GO_VERSION }}
+          zig-version: ${{ env.ZIG_VERSION }}
+          goos: linux
+          goarch: amd64
+
+      - name: Restore Go caches (arm64)
+        id: go-cache-arm64
+        uses: ./.github/actions/go-cache
+        with:
+          mode: restore
+          go-version: ${{ env.GO_VERSION }}
+          zig-version: ${{ env.ZIG_VERSION }}
+          goos: linux
+          goarch: arm64
 
       - name: Build static binaries for multi-arch
         env:
@@ -57,6 +82,26 @@ jobs:
 
           echo "Building for linux/arm64..."
           GOARCH=arm64 CC="zig cc -target aarch64-linux-musl" go build -trimpath -ldflags="$LDFLAGS" -o komari-linux-arm64
+
+      - name: Save Go build cache (amd64)
+        if: steps.go-cache-amd64.outputs.build-cache-hit != 'true'
+        uses: ./.github/actions/go-cache
+        with:
+          mode: save
+          go-version: ${{ env.GO_VERSION }}
+          zig-version: ${{ env.ZIG_VERSION }}
+          goos: linux
+          goarch: amd64
+
+      - name: Save Go build cache (arm64)
+        if: steps.go-cache-arm64.outputs.build-cache-hit != 'true'
+        uses: ./.github/actions/go-cache
+        with:
+          mode: save
+          go-version: ${{ env.GO_VERSION }}
+          zig-version: ${{ env.ZIG_VERSION }}
+          goos: linux
+          goarch: arm64
 
       - name: Upload Docker binaries
         uses: actions/upload-artifact@v4
@@ -111,3 +156,10 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Layer cache only. The COPY layer is keyed on the binary content, so a
+          # rebuilt binary still invalidates it, while `pull: true` keeps the
+          # Alpine base image current.
+          pull: true
+          cache-from: type=gha,scope=komari-docker-manual
+          cache-to: type=gha,mode=max,scope=komari-docker-manual
+          provenance: false
