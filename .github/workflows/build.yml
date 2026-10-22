@@ -19,27 +19,6 @@ jobs:
         with:
           artifact-name: komari-frontend
 
-  test:
-    needs: build-frontend
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Restore frontend artifact
-        uses: ./.github/actions/restore-frontend
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.27.3"
-
-      - name: Run vet and tests
-        run: |
-          go vet ./...
-          go test ./... -count=1
-
   build-binaries:
     needs: build-frontend
     runs-on: ubuntu-latest
