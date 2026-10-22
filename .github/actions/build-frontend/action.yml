@@ -4,7 +4,7 @@ description: Clone komari-web, build the default theme, and optionally upload it
 inputs:
   node-version:
     description: Node.js version used to build komari-web.
-    default: "24"
+    default: "26.12.1"
   repository:
     description: komari-web repository URL.
     default: https://github.com/musicclub1563/komari-web
@@ -24,6 +24,21 @@ runs:
       uses: actions/setup-node@v4
       with:
         node-version: ${{ inputs.node-version }}
+        check-latest: true
+
+    - name: Verify Node.js and npm versions
+      shell: bash
+      run: |
+        set -euxo pipefail
+        expected="v${{ inputs.node-version }}"
+        node_version="$(node --version)"
+        npm_version="$(npm --version)"
+        echo "node --version: $node_version"
+        echo "npm --version: $npm_version"
+        if [ "$node_version" != "$expected" ]; then
+          echo "Node.js version mismatch: expected $expected but got $node_version" >&2
+          exit 1
+        fi
 
     - name: Install zstd
       shell: bash
