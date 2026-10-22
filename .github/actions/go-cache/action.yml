@@ -1,0 +1,61 @@
+name: Go caches
+description: >-
+  Restore the Go module download cache shared by every job in a workflow run and
+  the per-target Go build cache. The build cache key includes GOOS/GOARCH, CGO
+  and the Zig toolchain version so parallel matrix jobs never fight over a single
+  key.
+
+inputs:
+  mode:
+    description: Either "restore" (module + build cache) or "save" (build cache only).
+    default: restore
+  go-version:
+    description: Go toolchain version, part of every cache key.
+    default: "1.27.3"
+  zig-version:
+    description: Zig version used for CGO cross-compilation, part of the build cache key.
+    default: "0.14.1"
+  goos:
+    description: Target GOOS for the build cache.
+    required: true
+  goarch:
+    description: Target GOARCH for the build cache.
+    required: true
+  cgo-enabled:
+    description: CGO_ENABLED value for the build cache.
+    default: "1"
+
+outputs:
+  build-cache-hit:
+    description: Whether the per-target Go build cache was restored.
+    value: ${{ steps.build-restore.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Restore Go module cache
+      if: inputs.mode == 'restore'
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/go/pkg/mod
+        key: go-mod-${{ runner.os }}-go${{ inputs.go-version }}-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          go-mod-${{ runner.os }}-go${{ inputs.go-version }}-
+
+    - name: Restore Go build cache
+      id: build-restore
+      if: inputs.mode == 'restore'
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.cache/go-build
+        key: go-build-${{ runner.os }}-${{ inputs.goos }}-${{ inputs.goarch }}-cgo${{ inputs.cgo-enabled }}-zig${{ inputs.zig-version }}-go${{ inputs.go-version }}-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          go-build-${{ runner.os }}-${{ inputs.goos }}-${{ inputs.goarch }}-cgo${{ inputs.cgo-enabled }}-zig${{ inputs.zig-version }}-go${{ inputs.go-version }}-
+          go-build-${{ runner.os }}-${{ inputs.goos }}-${{ inputs.goarch }}-
+
+    - name: Save Go build cache
+      if: inputs.mode == 'save'
+      uses: actions/cache/save@v4
+      with:
+        path: ~/.cache/go-build
+        key: go-build-${{ runner.os }}-${{ inputs.goos }}-${{ inputs.goarch }}-cgo${{ inputs.cgo-enabled }}-zig${{ inputs.zig-version }}-go${{ inputs.go-version }}-${{ hashFiles('**/go.sum') }}

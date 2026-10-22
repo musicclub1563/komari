@@ -6,6 +6,15 @@ on:
       - main
   workflow_dispatch:
 
+# A new push to the same PR cancels the previous run instead of queueing behind it.
+concurrency:
+  group: pr-build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.27.3"
+  ZIG_VERSION: "0.14.1"
+
 jobs:
   build-frontend:
     runs-on: ubuntu-latest
@@ -19,54 +28,37 @@ jobs:
         with:
           artifact-name: komari-frontend
 
-  build-binaries:
-    needs: build-frontend
+  # Downloads modules once per run so the matrix and test jobs restore the same
+  # module cache instead of racing to save one shared key.
+  go-modules:
     runs-on: ubuntu-latest
 
-    strategy:
-      matrix:
-        goos: [windows, linux]
-        goarch: [amd64, arm64, 386, riscv64]
-        include:
-          # Windows
-          - goos: windows
-            goarch: amd64
-            zig_target_triple: x86_64-windows-gnu
-            binary_extension: .exe
-          - goos: windows
-            goarch: arm64
-            zig_target_triple: aarch64-windows-gnu
-            binary_extension: .exe
-          - goos: windows
-            goarch: 386
-            zig_target_triple: x86-windows-gnu
-            binary_extension: .exe
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-          # Linux
-          - goos: linux
-            goarch: amd64
-            zig_target_triple: x86_64-linux-musl
-            binary_extension: ""
-          - goos: linux
-            goarch: arm64
-            zig_target_triple: aarch64-linux-musl
-            binary_extension: ""
-          - goos: linux
-            goarch: 386
-            zig_target_triple: x86-linux-musl
-            binary_extension: ""
-          - goos: linux
-            goarch: riscv64
-            zig_target_triple: riscv64-linux-musl
-            binary_extension: ""
-          - goos: linux
-            goarch: loong64
-            zig_target_triple: loongarch64-linux-musl
-            binary_extension: ""
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
 
-        exclude:
-          - goos: windows
-            goarch: riscv64
+      - name: Restore Go module cache
+        id: go-mod-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-${{ runner.os }}-go${{ env.GO_VERSION }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            go-mod-${{ runner.os }}-go${{ env.GO_VERSION }}-
+
+      - name: Download Go modules
+        if: steps.go-mod-cache.outputs.cache-hit != 'true'
+        run: go mod download
+
+  test:
+    needs: [build-frontend, go-modules]
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
@@ -78,10 +70,79 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.27.3"
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Restore Go caches
+        id: go-cache
+        uses: ./.github/actions/go-cache
+        with:
+          mode: restore
+          go-version: ${{ env.GO_VERSION }}
+          zig-version: ${{ env.ZIG_VERSION }}
+          goos: linux
+          goarch: amd64
+
+      - name: Run vet and tests
+        run: |
+          go vet ./...
+          go test ./... -count=1
+
+      - name: Save Go build cache
+        if: steps.go-cache.outputs.build-cache-hit != 'true'
+        uses: ./.github/actions/go-cache
+        with:
+          mode: save
+          go-version: ${{ env.GO_VERSION }}
+          zig-version: ${{ env.ZIG_VERSION }}
+          goos: linux
+          goarch: amd64
+
+  # PRs verify the two most common targets; releases keep the full matrix.
+  build-binaries:
+    needs: [build-frontend, go-modules]
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            zig_target_triple: x86_64-linux-musl
+            binary_extension: ""
+          - goos: windows
+            goarch: amd64
+            zig_target_triple: x86_64-windows-gnu
+            binary_extension: .exe
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Restore frontend artifact
+        uses: ./.github/actions/restore-frontend
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
 
       - name: Install Zig cross-compiler toolchain
         uses: ./.github/actions/setup-zig
+        with:
+          zig-version: ${{ env.ZIG_VERSION }}
+
+      - name: Restore Go caches
+        id: go-cache
+        uses: ./.github/actions/go-cache
+        with:
+          mode: restore
+          go-version: ${{ env.GO_VERSION }}
+          zig-version: ${{ env.ZIG_VERSION }}
+          goos: ${{ matrix.goos }}
+          goarch: ${{ matrix.goarch }}
 
       - name: Build binary
         env:
@@ -92,7 +153,6 @@ jobs:
           GIN_MODE: release
         run: |
           BINARY_NAME=komari-${{ matrix.goos }}-${{ matrix.goarch }}
-          # Append the appropriate executable extension based on the OS
           if [ "${{ matrix.binary_extension }}" != "" ]; then
             BINARY_NAME=${BINARY_NAME}${{ matrix.binary_extension }}
           fi
@@ -103,6 +163,16 @@ jobs:
             LDFLAGS="$LDFLAGS -extldflags=-Wl,--strip-all"
           fi
           go build -trimpath -ldflags="$LDFLAGS" -o "$BINARY_NAME"
+
+      - name: Save Go build cache
+        if: steps.go-cache.outputs.build-cache-hit != 'true'
+        uses: ./.github/actions/go-cache
+        with:
+          mode: save
+          go-version: ${{ env.GO_VERSION }}
+          zig-version: ${{ env.ZIG_VERSION }}
+          goos: ${{ matrix.goos }}
+          goarch: ${{ matrix.goarch }}
 
       - name: Upload binary as artifact
         uses: actions/upload-artifact@v4
