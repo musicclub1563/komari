@@ -16,7 +16,7 @@ on:
           komari-web commit, branch, or tag to build. Defaults to the pinned
           commit with the dependency security fixes; leave empty to keep it.
         required: false
-        default: 2675059ce88979630633527f6e42774c1dabb006
+        default: e7b8d9dad4fab2cfdda65b2623bc08fc304c3d81
         type: string
 
 permissions:
