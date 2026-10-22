@@ -244,7 +244,9 @@ func TestHTTPClientRequestErrorWithoutListenerStillCloses(t *testing.T) {
 	url := server.URL
 	server.Close()
 
-	var output bytes.Buffer
+	// The event loop keeps writing console output after Call returns, so the
+	// buffer must be synchronized and waited on instead of read after a sleep.
+	var output syncBuffer
 	runtime, err := New(`
 		function sendMessage(url) {
 			return new Promise((resolve) => {
@@ -260,8 +262,7 @@ func TestHTTPClientRequestErrorWithoutListenerStillCloses(t *testing.T) {
 	if err := runtime.Call("sendMessage", url); err != nil {
 		t.Fatalf("request close did not fire after connection failure: %v", err)
 	}
-	time.Sleep(80 * time.Millisecond)
-	if !strings.Contains(output.String(), "setTimeout callback failed") {
+	if !output.waitFor("setTimeout callback failed", 2*time.Second) {
 		t.Fatalf("unhandled request error was not surfaced: %s", output.String())
 	}
 }
