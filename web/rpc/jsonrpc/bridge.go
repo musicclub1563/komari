@@ -2,12 +2,16 @@ package jsonrpc
 
 import (
 	"encoding/json"
-	"io"
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 	"github.com/komari-monitor/komari/pkg/rpc"
 )
+
+// errInvalidJSONBody marks a body that was read within the limit but is not
+// valid JSON, as opposed to a body that exceeded the limit.
+var errInvalidJSONBody = errors.New("invalid request body")
 
 // bridge.go
 // 声明式路由桥：把一个 gin 路由直接绑定到 RPC2 方法，无需手写 handler。
@@ -63,8 +67,12 @@ func Bind(method string, opts ...BindOption) gin.HandlerFunc {
 		o(cfg)
 	}
 	return func(c *gin.Context) {
-		params, ok := assembleParams(c, cfg)
-		if !ok {
+		params, err := assembleParams(c, cfg)
+		if err != nil {
+			if isBodyTooLarge(err) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{"status": "error", "message": "Request body too large"})
+				return
+			}
 			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "Invalid or missing request body"})
 			return
 		}
@@ -76,19 +84,23 @@ func Bind(method string, opts ...BindOption) gin.HandlerFunc {
 // assembleParams 从 body + path + query 装配 RPC 参数。
 // body 为 JSON 对象时与 path/query 合并为一个对象；body 为数组（且无 path/query）时直接透传数组。
 // 返回 ok=false 表示请求体存在但无法解析为合法 JSON（畸形 body）。
-func assembleParams(c *gin.Context, cfg *bindConfig) (any, bool) {
+func assembleParams(c *gin.Context, cfg *bindConfig) (any, error) {
 	var bodyVal any
 	if c.Request.Body != nil {
-		if raw, err := io.ReadAll(c.Request.Body); err == nil && len(raw) > 0 {
+		raw, err := readLimitedJSONBody(c)
+		if err != nil {
+			return nil, err
+		}
+		if len(raw) > 0 {
 			if err := json.Unmarshal(raw, &bodyVal); err != nil {
-				return nil, false
+				return nil, errInvalidJSONBody
 			}
 		}
 	}
 
 	// 数组 body 且无附加参数：直接透传。
 	if arr, ok := bodyVal.([]any); ok && len(cfg.pathParams) == 0 && len(cfg.queryParams) == 0 {
-		return arr, true
+		return arr, nil
 	}
 
 	obj := map[string]any{}
@@ -107,7 +119,7 @@ func assembleParams(c *gin.Context, cfg *bindConfig) (any, bool) {
 			obj[name] = v
 		}
 	}
-	return obj, true
+	return obj, nil
 }
 
 // rpcErrorHTTPStatus 将 JSON-RPC 错误码映射为合适的 HTTP 状态码。

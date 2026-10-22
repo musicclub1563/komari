@@ -1,9 +1,6 @@
 package api
 
 import (
-	"bytes"
-	"encoding/json"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -161,20 +158,13 @@ func extractClientToken(c *gin.Context) string {
 		return token
 	}
 
-	if c.Request.Method != http.MethodGet {
-		bodyBytes, err := io.ReadAll(c.Request.Body)
-		if err != nil {
-			return ""
-		}
-		c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-
-		var body struct {
-			Token string `json:"token"`
-		}
-		if json.Unmarshal(bodyBytes, &body) == nil {
-			return body.Token
-		}
-	}
+	// The agent protocol carries the client token in the query string only.
+	// Reading every unauthenticated request body here allowed an anonymous
+	// caller to make the identity middleware buffer an arbitrarily large body
+	// (16 MiB was reproducible) before any handler or size limit applied. The
+	// JSON body fallback was checked against the router: no endpoint extracts a
+	// token from the body, so it is removed rather than replaced with another
+	// unconditional read.
 	return ""
 }
 
