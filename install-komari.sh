@@ -56,7 +56,7 @@ BACKUP_DIR="$INSTALL_DIR/backup"
 DATA_BACKUP_DIR="$DATA_DIR/data/backup"
 DEFAULT_PORT="25774"
 LISTEN_PORT=""
-STANDARD_REPO="komari-monitor/komari"
+STANDARD_REPO="musicclub1563/komari"
 LITE_REPO="nuomiiiii/komari"
 REPO="$STANDARD_REPO"
 # 发行版本: standard（标准版）或 lite（Lite 轻量版）
