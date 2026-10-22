@@ -12,8 +12,11 @@ on:
         required: true
         type: string
       frontend_ref:
-        description: komari-web commit, branch, or tag to build.
-        required: true
+        description: >-
+          komari-web commit, branch, or tag to build. Defaults to the pinned
+          commit with the dependency security fixes; leave empty to keep it.
+        required: false
+        default: 2675059ce88979630633527f6e42774c1dabb006
         type: string
 
 permissions:
