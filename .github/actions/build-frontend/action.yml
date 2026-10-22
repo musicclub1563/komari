@@ -4,12 +4,14 @@ description: Clone komari-web, build the default theme, and optionally upload it
 inputs:
   node-version:
     description: Node.js version used to build komari-web.
-    default: "24"
+    default: "26.12.1"
   repository:
     description: komari-web repository URL.
-    default: https://github.com/komari-monitor/komari-web
+    default: https://github.com/musicclub1563/komari-web
   ref:
-    description: Optional komari-web ref to build. Uses the repository default branch when empty.
+    description: >-
+      komari-web commit SHA, branch, or tag to build. Leave empty to use the
+      pinned commit that contains the dependency security fixes.
     default: ""
   artifact-name:
     description: Optional artifact name for the packed frontend theme.
@@ -22,6 +24,21 @@ runs:
       uses: actions/setup-node@v4
       with:
         node-version: ${{ inputs.node-version }}
+        check-latest: true
+
+    - name: Verify Node.js and npm versions
+      shell: bash
+      run: |
+        set -euxo pipefail
+        expected="v${{ inputs.node-version }}"
+        node_version="$(node --version)"
+        npm_version="$(npm --version)"
+        echo "node --version: $node_version"
+        echo "npm --version: $npm_version"
+        if [ "$node_version" != "$expected" ]; then
+          echo "Node.js version mismatch: expected $expected but got $node_version" >&2
+          exit 1
+        fi
 
     - name: Install zstd
       shell: bash
@@ -36,14 +53,37 @@ runs:
       shell: bash
       run: |
         set -euxo pipefail
+        REPO="${{ inputs.repository }}"
+        # Single source of truth for the verified komari-web commit. Keeping it
+        # here means an empty ref still builds the pinned frontend instead of
+        # falling back to the repository default branch.
+        PINNED_REF="2675059ce88979630633527f6e42774c1dabb006"
+        REF="${{ inputs.ref }}"
+        REF="${REF:-$PINNED_REF}"
         rm -rf komari-web
-        if [ -n "${{ inputs.ref }}" ]; then
-          git clone --depth=1 --branch "${{ inputs.ref }}" "${{ inputs.repository }}" komari-web
+        if [ -n "$REF" ]; then
+          # Pinned refs are usually commit SHAs, which `git clone --branch`
+          # cannot check out. Fetch the ref explicitly and fall back to a
+          # branch/tag clone when the server refuses a direct SHA fetch.
+          git init -q komari-web
+          git -C komari-web remote add origin "$REPO"
+          if git -C komari-web fetch --depth=1 origin "$REF"; then
+            git -C komari-web checkout -q --detach FETCH_HEAD
+          else
+            rm -rf komari-web
+            git clone --depth=1 --branch "$REF" "$REPO" komari-web
+          fi
         else
-          git clone --depth=1 "${{ inputs.repository }}" komari-web
+          git clone --depth=1 "$REPO" komari-web
         fi
         cd komari-web
-        npm install
+        resolved_sha=$(git rev-parse HEAD)
+        echo "komari-web commit: $resolved_sha"
+        if [[ "$REF" =~ ^[0-9a-f]{40}$ ]] && [ "$resolved_sha" != "$REF" ]; then
+          echo "komari-web ref mismatch: expected $REF but checked out $resolved_sha" >&2
+          exit 1
+        fi
+        if [ -f package-lock.json ]; then npm ci; else npm install; fi
         npm run build
         cd ..
 
