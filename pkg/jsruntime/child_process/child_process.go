@@ -304,9 +304,15 @@ func (m *Module) spawnChild(vm *moejs.Runtime, command string, arguments []strin
 		}
 		return native.From(vm, false), nil
 	}))
-	m.pipeChildOutput(vm, stdoutReader, stdout, options.encoding)
-	m.pipeChildOutput(vm, stderrReader, stderr, options.encoding)
+	var output sync.WaitGroup
+	output.Add(2)
+	m.pipeChildOutput(vm, stdoutReader, stdout, options.encoding, &output)
+	m.pipeChildOutput(vm, stderrReader, stderr, options.encoding, &output)
 	go func() {
+		// Drain stdout/stderr before Wait closes the pipes, so the stream data
+		// and end events are always delivered before the exit/close events.
+		// Calling Wait while a pipe read is still in flight can drop output.
+		output.Wait()
 		err := cmd.Wait()
 		cancel()
 		m.runtime.RemoveResource(resourceID)
@@ -422,13 +428,14 @@ func childCallback(args []moejs.Value) moejs.Value {
 	}
 	return moejs.Undefined()
 }
-func (m *Module) pipeChildOutput(vm *moejs.Runtime, reader io.Reader, stream *engine.Object, encoding string) {
+func (m *Module) pipeChildOutput(vm *moejs.Runtime, reader io.Reader, stream *engine.Object, encoding string, done *sync.WaitGroup) {
 	push, _ := checkedFunction(native.Get(vm, stream, "push"))
 	setEncoding, _ := checkedFunction(native.Get(vm, stream, "setEncoding"))
 	if encoding != "" && !native.IsNil(setEncoding) {
 		_, _ = native.Call(vm, setEncoding, engine.ObjectValue(stream), native.From(vm, encoding))
 	}
 	go func() {
+		defer done.Done()
 		data := make([]byte, 32*1024)
 		for {
 			count, err := reader.Read(data)
