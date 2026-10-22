@@ -24,6 +24,11 @@ import (
 	"time"
 )
 
+// childProcessWaitDelay bounds how long Wait keeps waiting for stdout/stderr
+// I/O after the process has been signalled. A grandchild that inherited the
+// pipes must not be able to block cancellation or runtime shutdown forever.
+const childProcessWaitDelay = 200 * time.Millisecond
+
 type childCommandOptions struct {
 	cwd       string
 	env       []string
@@ -204,23 +209,41 @@ func (m *Module) childOptions(vm *moejs.Runtime, value moejs.Value) childCommand
 	return options
 }
 func childExecCommand(command string, arguments []string, options childCommandOptions) (*exec.Cmd, context.CancelFunc) {
-	ctx := context.Background()
-	cancel := func() {
-	}
+	// Always create a cancellable context. Previously a command without an
+	// explicit timeout got a no-op cancel func, so maxBuffer overruns and
+	// runtime shutdown could not terminate it.
+	var ctx context.Context
+	var cancel context.CancelFunc
 	if options.timeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, options.timeout)
+		ctx, cancel = context.WithTimeout(context.Background(), options.timeout)
+	} else {
+		ctx, cancel = context.WithCancel(context.Background())
 	}
+
+	var cmd *exec.Cmd
 	if options.shell {
 		line := command
 		if len(arguments) > 0 {
 			line += " " + strings.Join(arguments, " ")
 		}
 		if runtime.GOOS == "windows" {
-			return exec.CommandContext(ctx, "cmd.exe", "/d", "/s", "/c", line), cancel
+			cmd = exec.CommandContext(ctx, "cmd.exe", "/d", "/s", "/c", line)
+		} else {
+			cmd = exec.CommandContext(ctx, "/bin/sh", "-c", line)
 		}
-		return exec.CommandContext(ctx, "/bin/sh", "-c", line), cancel
+	} else {
+		cmd = exec.CommandContext(ctx, command, arguments...)
 	}
-	return exec.CommandContext(ctx, command, arguments...), cancel
+
+	configureChildProcess(cmd)
+	cmd.WaitDelay = childProcessWaitDelay
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return killChildProcess(cmd.Process)
+	}
+	return cmd, cancel
 }
 func (m *Module) childOutputLimit(options childCommandOptions) int {
 	if options.maxBuffer > 0 && options.maxBuffer < m.maxOutput {
@@ -234,11 +257,16 @@ func (m *Module) spawnChild(vm *moejs.Runtime, command string, arguments []strin
 	cmd.Dir = options.cwd
 	cmd.Env = options.env
 	stdin, stdinErr := cmd.StdinPipe()
-	stdoutReader, stdoutErr := cmd.StdoutPipe()
-	stderrReader, stderrErr := cmd.StderrPipe()
+	// Use explicit pipes instead of StdoutPipe/StderrPipe: those are closed by
+	// cmd.Wait, which would force us to finish reading before knowing the exit
+	// status. Owning the fds lets exit and close be reported independently.
+	stdoutReader, stdoutWriter, stdoutErr := os.Pipe()
+	stderrReader, stderrWriter, stderrErr := os.Pipe()
 	if err := errors.Join(stdinErr, stdoutErr, stderrErr); err != nil {
 		panic(native.GoError(vm, err))
 	}
+	cmd.Stdout = stdoutWriter
+	cmd.Stderr = stderrWriter
 	stdinStream, stdout, stderr := m.childStreams(vm, stdin)
 	_ = native.Set(vm, child, "stdout", stdout)
 	_ = native.Set(vm, child, "stderr", stderr)
@@ -250,6 +278,10 @@ func (m *Module) spawnChild(vm *moejs.Runtime, command string, arguments []strin
 	_ = native.Set(vm, child, "killed", false)
 	_ = native.Set(vm, child, "connected", false)
 	if err := cmd.Start(); err != nil {
+		_ = stdoutWriter.Close()
+		_ = stderrWriter.Close()
+		_ = stdoutReader.Close()
+		_ = stderrReader.Close()
 		cancel()
 		m.runtime.Loop().SetTimeout(func(vm *moejs.Runtime) {
 			_ = m.runtime.RunJob(vm, "child_process.spawn", func() error {
@@ -258,10 +290,18 @@ func (m *Module) spawnChild(vm *moejs.Runtime, command string, arguments []strin
 		}, 0)
 		return child
 	}
+	// The parent must not keep the write ends open, otherwise the readers never
+	// see EOF after the command tree exits.
+	_ = stdoutWriter.Close()
+	_ = stderrWriter.Close()
 	_ = native.Set(vm, child, "pid", cmd.Process.Pid)
 	resourceID := m.runtime.AddResource(func() {
-		_ = cmd.Process.Kill()
 		cancel()
+		_ = killChildProcess(cmd.Process)
+		// Closing the read ends unblocks the output pumps so close can still be
+		// reported when a surviving grandchild holds the pipes.
+		_ = stdoutReader.Close()
+		_ = stderrReader.Close()
 	})
 	if resourceID == 0 {
 		_ = stdin.Close()
@@ -309,27 +349,38 @@ func (m *Module) spawnChild(vm *moejs.Runtime, command string, arguments []strin
 	m.pipeChildOutput(vm, stdoutReader, stdout, options.encoding, &output)
 	m.pipeChildOutput(vm, stderrReader, stderr, options.encoding, &output)
 	go func() {
-		// Drain stdout/stderr before Wait closes the pipes, so the stream data
-		// and end events are always delivered before the exit/close events.
-		// Calling Wait while a pipe read is still in flight can drop output.
-		output.Wait()
-		err := cmd.Wait()
+		// Wait returns when the direct child exits: stdout/stderr are files we
+		// own, so exec does not copy them and does not wait for the pipes to
+		// drain. That keeps "exit" tied to the direct child.
+		waitErr := cmd.Wait()
 		cancel()
-		m.runtime.RemoveResource(resourceID)
+
 		exitCode := 0
-		if err != nil {
-			if exitError, ok := err.(*exec.ExitError); ok {
+		if waitErr != nil {
+			var exitError *exec.ExitError
+			if errors.As(waitErr, &exitError) {
 				exitCode = exitError.ExitCode()
 			} else {
 				exitCode = -1
 			}
 		}
+
 		m.runtime.RunOnLoop(func(vm *moejs.Runtime) {
-			_ = m.runtime.RunJob(vm, "child_process", func() error {
+			_ = m.runtime.RunJob(vm, "child_process exit", func() error {
 				_ = native.Set(vm, child, "exitCode", exitCode)
-				if emitErr := events.Emit(vm, child, "exit", exitCode, moejs.Null()); emitErr != nil {
-					return emitErr
-				}
+				return events.Emit(vm, child, "exit", exitCode, moejs.Null())
+			})
+		})
+
+		// "close" waits for stdout/stderr EOF, so it fires after all data and
+		// end events, even when a surviving grandchild keeps the pipes open.
+		output.Wait()
+		_ = stdoutReader.Close()
+		_ = stderrReader.Close()
+		m.runtime.RemoveResource(resourceID)
+
+		m.runtime.RunOnLoop(func(vm *moejs.Runtime) {
+			_ = m.runtime.RunJob(vm, "child_process close", func() error {
 				return events.Emit(vm, child, "close", exitCode, moejs.Null())
 			})
 		})
@@ -490,8 +541,8 @@ func (m *Module) execChild(vm *moejs.Runtime, command string, arguments []string
 	}
 	_ = native.Set(vm, child, "pid", cmd.Process.Pid)
 	resourceID := m.runtime.AddResource(func() {
-		_ = cmd.Process.Kill()
 		cancel()
+		_ = killChildProcess(cmd.Process)
 	})
 	if resourceID == 0 {
 		go func() {
@@ -554,7 +605,19 @@ func (m *Module) runChildSync(command string, arguments []string, options childC
 	stdout := &childOutputBuffer{limit: outputLimit, stream: "stdout", cancel: cancel}
 	stderr := &childOutputBuffer{limit: outputLimit, stream: "stderr", cancel: cancel}
 	cmd.Stdout, cmd.Stderr = stdout, stderr
-	err := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		return childSyncResult{err: err, exitCode: -1}
+	}
+	// Register the process with the runtime so Runtime.Close (or a cancelled
+	// call) terminates it instead of waiting for it to finish on its own.
+	resourceID := m.runtime.AddResource(func() {
+		cancel()
+		_ = killChildProcess(cmd.Process)
+	})
+	if resourceID != 0 {
+		defer m.runtime.RemoveResource(resourceID)
+	}
+	err := cmd.Wait()
 	err = errors.Join(err, stdout.err, stderr.err)
 	result := childSyncResult{stdout: stdout.Bytes(), stderr: stderr.Bytes(), err: err, exitCode: 0}
 	if cmd.Process != nil {
