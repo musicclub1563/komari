@@ -15,6 +15,24 @@ import (
 	"github.com/komari-monitor/komari/web/api"
 )
 
+// maxJSONBodyBytes bounds JSON request bodies that are buffered in memory.
+// Large payloads (file transfers, backups, chunked uploads) use dedicated REST
+// endpoints and are not read here.
+const maxJSONBodyBytes = 8 << 20
+
+// readLimitedJSONBody buffers a request body up to maxJSONBodyBytes. The limit
+// is enforced by MaxBytesReader before the first read, so it also covers chunked
+// bodies and requests without a Content-Length header.
+func readLimitedJSONBody(c *gin.Context) ([]byte, error) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxJSONBodyBytes)
+	return io.ReadAll(c.Request.Body)
+}
+
+func isBodyTooLarge(err error) bool {
+	var tooLarge *http.MaxBytesError
+	return errors.As(err, &tooLarge)
+}
+
 // OnRpcRequest 是 /api/rpc2 的统一入口：GET 升级为 WebSocket，POST 处理单条/批量 JSON-RPC。
 func OnRpcRequest(c *gin.Context) {
 	// GET -> WebSocket
@@ -119,8 +137,12 @@ func serveWebSocket(c *gin.Context) {
 }
 
 func servePost(c *gin.Context) {
-	body, err := io.ReadAll(c.Request.Body)
+	body, err := readLimitedJSONBody(c)
 	if err != nil {
+		if isBodyTooLarge(err) {
+			c.JSON(http.StatusRequestEntityTooLarge, rpc.ErrorResponse(nil, rpc.InvalidRequest, "request body too large", nil))
+			return
+		}
 		c.JSON(http.StatusBadRequest, rpc.ErrorResponse(nil, rpc.ParseError, "read body error", err.Error()))
 		return
 	}

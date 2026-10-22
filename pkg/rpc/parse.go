@@ -3,7 +3,13 @@ package rpc
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 )
+
+// MaxBatchRequests bounds how many calls a single JSON-RPC batch may contain.
+// The body size limit already caps the payload, but an explicit batch limit
+// stops one small request from fanning out into unbounded work.
+const MaxBatchRequests = 100
 
 // ParseRequest 解析单个 JSON-RPC 请求。返回请求与错误（解析层面）。
 func ParseRequest(data []byte) (*JsonRpcRequest, *JsonRpcError) {
@@ -42,6 +48,9 @@ func ParseRequests(data []byte) ([]*JsonRpcRequest, *JsonRpcError) {
 		}
 		if len(arr) == 0 {
 			return nil, &JsonRpcError{Code: InvalidRequest, Message: "empty batch"}
+		}
+		if len(arr) > MaxBatchRequests {
+			return nil, &JsonRpcError{Code: InvalidRequest, Message: fmt.Sprintf("batch too large: %d > %d", len(arr), MaxBatchRequests)}
 		}
 		res := make([]*JsonRpcRequest, 0, len(arr))
 		for i := range arr {

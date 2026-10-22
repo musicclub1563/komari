@@ -88,6 +88,13 @@ jobs:
           go vet ./...
           go test ./... -count=1
 
+      # The spawn/output bugs were Linux-specific, so repeat the regression
+      # cases here instead of relying on a single run or a local Windows pass.
+      - name: Repeat child_process regressions
+        run: |
+          go test ./pkg/jsruntime -run '^TestChildProcessPermissionAndExecution$' -count=100
+          go test ./pkg/jsruntime -count=3 -v -run 'TestSpawnExitPrecedesCloseWhenBackgroundHoldsPipes|TestExecFileSyncMaxBufferTerminatesChild|TestRuntimeCloseTerminatesTimedOutSyncChild|TestRuntimeCloseTerminatesSpawnedChild|TestSpawnLargeOutputAndExitOrdering|TestSpawnNonZeroExitOrdering'
+
       - name: Save Go build cache
         if: steps.go-cache.outputs.build-cache-hit != 'true'
         uses: ./.github/actions/go-cache
