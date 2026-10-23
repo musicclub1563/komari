@@ -41,6 +41,8 @@ func (a *App) runGuideServer(controller guideController, cfg guideServerConfig) 
 	defer controller.Deactivate()
 
 	r := gin.New()
+	// 引导/恢复页面同样记录客户端 IP，沿用与应用路由一致的可信代理解析。
+	_ = applyTrustedProxies(r, a.settings.TrustedProxies)
 	r.Use(logger.GinLogger(), logger.GinRecovery(), noStoreAPIResponses())
 	if cfg.requireIdentity {
 		cors := security.NewCorsController(a.settings.CorsOriginCheckEnabled, a.settings.CorsAllowedOrigins)

@@ -17,7 +17,11 @@ type Settings struct {
 	ScriptDomain           string `json:"script_domain" default:""`                            // 自定义脚本域名
 	SendIpAddrToGuest      bool   `json:"send_ip_addr_to_guest" default:"false"`               // 是否向访客页面发送 IP 地址，默认 false
 	SSRFProtectionEnabled  bool   `json:"ssrf_protection_enabled" default:"false"`             // 是否启用 SSRF 防护，默认关闭
-	EulaAccepted           bool   `json:"eula_accepted" default:"false"`
+	// TrustedProxies 是允许提供 X-Forwarded-For/X-Real-IP 的反向代理地址列表
+	// (逗号分隔的 IP 或 CIDR)。为空表示不信任任何代理头，ClientIP 一律取
+	// 连接的真实源地址。也可用环境变量 KOMARI_TRUSTED_PROXIES 覆盖。
+	TrustedProxies string `json:"trusted_proxies" default:""`
+	EulaAccepted   bool   `json:"eula_accepted" default:"false"`
 	BaseScriptsURLKey      string `json:"base_scripts_url" default:""`
 	// GeoIP 配置
 	GeoIpEnabled  bool   `json:"geo_ip_enabled" default:"true"`

@@ -1,9 +1,7 @@
 package plugin
 
 import (
-	"net"
 	"net/http"
-	"strings"
 
 	"github.com/Calcium-Ion/moejs"
 	"github.com/Calcium-Ion/moejs/engine"
@@ -79,21 +77,12 @@ func principalTypeString(t rpc.PrincipalType) string {
 	}
 }
 
-// remoteIP mirrors gin's ClientIP for the raw request layer: first
-// X-Forwarded-For entry, then X-Real-IP, then the RemoteAddr host.
+// remoteIP resolves the client address for the raw HTTP hook layer with the
+// same policy as gin's ClientIP, via pkg/clientip. Forwarded headers are only
+// honoured when the connection itself comes from a configured trusted proxy,
+// and a malformed chain falls back to the connection address instead of
+// accepting an attacker-chosen entry. Otherwise any caller could choose the IP
+// that plugins observe.
 func remoteIP(r *http.Request) string {
-	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-		if first, _, ok := strings.Cut(forwarded, ","); ok {
-			return strings.TrimSpace(first)
-		}
-		return strings.TrimSpace(forwarded)
-	}
-	if real := r.Header.Get("X-Real-IP"); real != "" {
-		return strings.TrimSpace(real)
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+	return resolveClientIP(r)
 }

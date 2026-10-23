@@ -80,6 +80,8 @@ func (a *App) registerReloadHandlers(cors *security.CorsController) {
 // BuildRouter constructs the normal application router and starts reloads.
 func (a *App) BuildRouter() error {
 	r := gin.New()
+	// 必须在处理任何请求前配置：gin 默认信任所有对端提供的转发头。
+	_ = applyTrustedProxies(r, a.settings.TrustedProxies)
 	r.Use(logger.GinLogger(), logger.GinRecovery())
 	cors := security.NewCorsController(a.settings.CorsOriginCheckEnabled, a.settings.CorsAllowedOrigins)
 	r.Use(cors.Middleware(), api.IdentityMiddleware(), api.PrivateSiteMiddleware(), noStoreAPIResponses())
