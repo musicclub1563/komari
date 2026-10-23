@@ -50,6 +50,11 @@ func zipDirectoryExcluding(srcDir, dstZip string, exclude map[string]struct{}) e
 			}
 			return nil
 		}
+		// 恢复流程在数据目录内保留的暂存目录与上一版本数据不属于数据本身，
+		// 不能进入任何备份归档。
+		if info.IsDir() && isRestoreWorkDir(info.Name()) {
+			return filepath.SkipDir
+		}
 		// 计算 zip 内相对路径
 		rel, err := filepath.Rel(absSrc, path)
 		if err != nil {

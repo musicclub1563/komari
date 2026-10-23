@@ -9,7 +9,6 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/komari-monitor/komari/cmd/flags"
 )
@@ -20,7 +19,20 @@ const (
 
 	maxRestoreEntries       = 100_000
 	maxRestoreExpandedBytes = 4 << 30 // 4 GiB
+
+	// 暂存目录与上一版本数据都放在数据目录内部：部署上只保证数据目录可写
+	// （父目录可能是只读的镜像层或挂载父路径）。数据目录本身可能是 Docker
+	// bind mount / named volume 的挂载点，不能被重命名，因此切换只移动目录
+	// 内的条目，始终在同一文件系统内完成。
+	restoreStagingDirName  = ".komari-restore-staging"
+	restorePreviousDirName = ".komari-restore-previous"
 )
+
+// isRestoreWorkDir reports whether a directory name belongs to the restore
+// machinery and must stay out of backup archives.
+func isRestoreWorkDir(name string) bool {
+	return name == restoreStagingDirName || name == restorePreviousDirName
+}
 
 // restoreSwapHook lets tests inject a failure right before the data directory
 // is swapped. Production code leaves it nil.
@@ -38,16 +50,21 @@ var restoreActivateHook func(previousDir, dataDir string) error
 // previous directory), which callers keep for rollback and diagnostics.
 func restoreStagedBackup(archivePath, dataDir string) (string, error) {
 	cleanDataDir := filepath.Clean(dataDir)
-	stageParent := filepath.Dir(cleanDataDir)
-	if err := os.MkdirAll(stageParent, 0755); err != nil {
-		return "", fmt.Errorf("create restore staging parent: %w", err)
+	// 只要求数据目录本身可写：暂存目录建在数据目录内，既不依赖父目录可写，
+	// 也不需要重命名数据目录（挂载点无法重命名）。
+	if err := os.MkdirAll(cleanDataDir, 0755); err != nil {
+		return "", fmt.Errorf("create restore data directory: %w", err)
 	}
-	stagingDir, err := os.MkdirTemp(stageParent, ".komari-restore-*")
-	if err != nil {
+	stagingDir := filepath.Join(cleanDataDir, restoreStagingDirName)
+	// 清理上一次中断恢复留下的暂存目录；它只包含未通过校验的中间产物。
+	if err := os.RemoveAll(stagingDir); err != nil {
+		return "", fmt.Errorf("clear previous restore staging directory: %w", err)
+	}
+	if err := os.Mkdir(stagingDir, 0755); err != nil {
 		return "", fmt.Errorf("create restore staging directory: %w", err)
 	}
-	// After a successful swap the staging path no longer exists, so this only
-	// removes the failed attempt.
+	// After a successful swap the staging directory is empty or gone, so this
+	// only removes a failed attempt.
 	defer os.RemoveAll(stagingDir)
 
 	if err := extractArchive(archivePath, stagingDir); err != nil {
@@ -237,50 +254,96 @@ func validateSQLiteDatabase(databasePath string) error {
 	return nil
 }
 
-// swapDataDir moves the current data aside and activates staging. If the
-// activation fails, the previous directory is restored before returning.
+// swapDataDir moves every entry of dataDir into an internal backup directory
+// and then activates the staged entries. Only entries inside dataDir are
+// renamed, so the data directory itself (possibly a bind mount or named
+// volume mount point) is never renamed or removed, and every rename stays on
+// the same filesystem. Any failure restores the previous entries.
+//
+// It returns the directory holding the previous data, which is kept for
+// diagnostics and manual rollback.
 func swapDataDir(dataDir, stagingDir string) (string, error) {
-	if _, err := os.Stat(dataDir); err != nil {
-		if !os.IsNotExist(err) {
-			return "", fmt.Errorf("inspect current data: %w", err)
-		}
-		if err := os.Rename(stagingDir, dataDir); err != nil {
-			return "", fmt.Errorf("activate restored data: %w", err)
-		}
-		return "", nil
+	previousDir := filepath.Join(dataDir, restorePreviousDirName)
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		return "", fmt.Errorf("read current data directory: %w", err)
+	}
+	if err := os.RemoveAll(previousDir); err != nil {
+		return "", fmt.Errorf("clear the previous restore directory: %w", err)
+	}
+	if err := os.Mkdir(previousDir, 0755); err != nil {
+		return "", fmt.Errorf("create the previous data directory: %w", err)
 	}
 
-	previousDir := nextPreviousDataDir(dataDir)
-	if err := os.Rename(dataDir, previousDir); err != nil {
-		return "", fmt.Errorf("move current data aside: %w", err)
+	stagingName := filepath.Base(stagingDir)
+	previousName := filepath.Base(previousDir)
+	moved := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if name == stagingName || name == previousName {
+			continue
+		}
+		if err := os.Rename(filepath.Join(dataDir, name), filepath.Join(previousDir, name)); err != nil {
+			rollbackErr := rollbackDataDir(dataDir, previousDir, moved, nil)
+			if rollbackErr != nil {
+				return "", fmt.Errorf("move current data aside: %v (rollback failed: %v; previous data kept at %s)", err, rollbackErr, previousDir)
+			}
+			return "", fmt.Errorf("move current data aside: %w", err)
+		}
+		moved = append(moved, name)
 	}
+
 	if restoreActivateHook != nil {
 		if hookErr := restoreActivateHook(previousDir, dataDir); hookErr != nil {
-			if rollbackErr := os.Rename(previousDir, dataDir); rollbackErr != nil {
+			rollbackErr := rollbackDataDir(dataDir, previousDir, moved, nil)
+			if rollbackErr != nil {
 				return "", fmt.Errorf("activate restored data: %v (rollback failed: %v; previous data kept at %s)", hookErr, rollbackErr, previousDir)
 			}
 			return "", hookErr
 		}
 	}
-	if err := os.Rename(stagingDir, dataDir); err != nil {
-		if rollbackErr := os.Rename(previousDir, dataDir); rollbackErr != nil {
-			return "", fmt.Errorf("activate restored data: %v (rollback failed: %v; previous data kept at %s)", err, rollbackErr, previousDir)
+
+	staged, err := os.ReadDir(stagingDir)
+	if err != nil {
+		rollbackErr := rollbackDataDir(dataDir, previousDir, moved, nil)
+		if rollbackErr != nil {
+			return "", fmt.Errorf("read staged data: %v (rollback failed: %v; previous data kept at %s)", err, rollbackErr, previousDir)
 		}
-		return "", fmt.Errorf("activate restored data: %w", err)
+		return "", fmt.Errorf("read staged data: %w", err)
+	}
+	activated := make([]string, 0, len(staged))
+	for _, entry := range staged {
+		name := entry.Name()
+		if err := os.Rename(filepath.Join(stagingDir, name), filepath.Join(dataDir, name)); err != nil {
+			rollbackErr := rollbackDataDir(dataDir, previousDir, moved, activated)
+			if rollbackErr != nil {
+				return "", fmt.Errorf("activate restored data: %v (rollback failed: %v; previous data kept at %s)", err, rollbackErr, previousDir)
+			}
+			return "", fmt.Errorf("activate restored data: %w; the previous data was restored", err)
+		}
+		activated = append(activated, name)
 	}
 	return previousDir, nil
 }
 
-func nextPreviousDataDir(dataDir string) string {
-	parent := filepath.Dir(dataDir)
-	base := ".komari-previous-data-" + time.Now().UTC().Format("20060102-150405")
-	for attempt := 0; ; attempt++ {
-		candidate := filepath.Join(parent, base)
-		if attempt > 0 {
-			candidate = filepath.Join(parent, fmt.Sprintf("%s-%d", base, attempt))
-		}
-		if _, err := os.Stat(candidate); os.IsNotExist(err) {
-			return candidate
+// rollbackDataDir returns activated entries to the staging directory and moves
+// the previous data back into dataDir. It reports the first failure so callers
+// can tell the operator where the data is.
+func rollbackDataDir(dataDir, previousDir string, moved, activated []string) error {
+	stagingDir := filepath.Join(dataDir, restoreStagingDirName)
+	if err := os.MkdirAll(stagingDir, 0755); err != nil {
+		return err
+	}
+	var firstErr error
+	for _, name := range activated {
+		if err := os.Rename(filepath.Join(dataDir, name), filepath.Join(stagingDir, name)); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
+	for _, name := range moved {
+		if err := os.Rename(filepath.Join(previousDir, name), filepath.Join(dataDir, name)); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
