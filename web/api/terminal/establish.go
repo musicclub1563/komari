@@ -9,13 +9,19 @@ import (
 
 func EstablishConnection(c *gin.Context) {
 	session_id := c.Query("id")
+	// Browser 会在重连/挂起路径上被并发替换，必须在锁内读取快照。
 	TerminalSessionsMutex.Lock()
 	session, exists := TerminalSessions[session_id]
+	active := exists && session != nil && session.Browser != nil
+	sessionUUID := ""
+	if active {
+		sessionUUID = session.UUID
+	}
 	TerminalSessionsMutex.Unlock()
 	authenticatedUUID, _ := c.Get("client_uuid")
 	authenticatedString, hasAuthenticatedUUID := authenticatedUUID.(string)
-	if !exists || session == nil || session.Browser == nil ||
-		(hasAuthenticatedUUID && authenticatedString != "" && authenticatedString != session.UUID) {
+	if !active ||
+		(hasAuthenticatedUUID && authenticatedString != "" && authenticatedString != sessionUUID) {
 		c.JSON(404, gin.H{"status": "error", "error": "Session not found"})
 		return
 	}

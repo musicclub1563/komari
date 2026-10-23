@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"sync"
 	"time"
 
@@ -66,13 +67,21 @@ const maxConsecutiveDroppedFrames = 16
 // plugin interceptor when one is attached.
 type SafeConn struct {
 	conn *websocket.Conn
-	mu   sync.Mutex
-	ID   int64
+	// mu serializes writes only. It is held across the network write, so no
+	// lifecycle operation (Close in particular) may wait for it.
+	mu sync.Mutex
 
-	readLimit int64
+	// stateMu guards the fields below. It is only ever held for short,
+	// non-blocking sections, which keeps reads and Close independent of a
+	// blocked write.
+	stateMu sync.Mutex
 
+	ID int64
+
+	readLimit   int64
 	interceptor FrameInterceptor
 	info        *ConnInfo
+	closed      bool
 }
 
 func NewSafeConn(conn *websocket.Conn) *SafeConn {
@@ -88,8 +97,8 @@ func NewSafeConn(conn *websocket.Conn) *SafeConn {
 // reassembly, and the reader wrapper in readLimitedMessage additionally counts
 // decompressed bytes. It must be called before the first read.
 func (sc *SafeConn) SetReadLimit(limit int64) {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.stateMu.Lock()
+	defer sc.stateMu.Unlock()
 	sc.readLimit = limit
 	if limit > 0 {
 		sc.conn.SetReadLimit(limit)
@@ -99,8 +108,8 @@ func (sc *SafeConn) SetReadLimit(limit int64) {
 // SetInterceptor attaches the hook provider and the connection identity. It
 // must be called before any frame is read or written.
 func (sc *SafeConn) SetInterceptor(info *ConnInfo, interceptor FrameInterceptor) {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.stateMu.Lock()
+	defer sc.stateMu.Unlock()
 	sc.info = info
 	sc.interceptor = interceptor
 }
@@ -115,9 +124,9 @@ func (sc *SafeConn) readLimitedMessage() (int, []byte, error) {
 	if err != nil {
 		return 0, nil, err
 	}
-	sc.mu.Lock()
+	sc.stateMu.Lock()
 	limit := sc.readLimit
-	sc.mu.Unlock()
+	sc.stateMu.Unlock()
 	if limit <= 0 {
 		data, readErr := io.ReadAll(reader)
 		return messageType, data, readErr
@@ -146,9 +155,9 @@ func (sc *SafeConn) readFrame() (int, []byte, error) {
 		if err != nil {
 			return 0, nil, err
 		}
-		sc.mu.Lock()
+		sc.stateMu.Lock()
 		interceptor, info := sc.interceptor, sc.info
-		sc.mu.Unlock()
+		sc.stateMu.Unlock()
 		if interceptor == nil || info == nil {
 			return messageType, data, nil
 		}
@@ -167,14 +176,26 @@ func (sc *SafeConn) readFrame() (int, []byte, error) {
 func (sc *SafeConn) writeFrame(messageType int, data []byte) error {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
-	if sc.interceptor == nil || sc.info == nil {
+	interceptor, info, closed := sc.state()
+	if closed {
+		return net.ErrClosed
+	}
+	if interceptor == nil || info == nil {
 		return sc.conn.WriteMessage(messageType, data)
 	}
-	newType, newData, drop := sc.interceptor.OnSend(sc.info, messageType, data)
+	newType, newData, drop := interceptor.OnSend(info, messageType, data)
 	if drop {
 		return nil
 	}
 	return sc.conn.WriteMessage(newType, newData)
+}
+
+// state returns a consistent snapshot of the hook state. stateMu is never
+// held across I/O, so waiting for it while holding mu stays bounded.
+func (sc *SafeConn) state() (FrameInterceptor, *ConnInfo, bool) {
+	sc.stateMu.Lock()
+	defer sc.stateMu.Unlock()
+	return sc.interceptor, sc.info, sc.closed
 }
 
 func (sc *SafeConn) WriteMessage(messageType int, data []byte) error {
@@ -184,10 +205,14 @@ func (sc *SafeConn) WriteMessage(messageType int, data []byte) error {
 func (sc *SafeConn) WriteControl(messageType int, data []byte, deadline time.Time) error {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
-	if sc.interceptor == nil || sc.info == nil {
+	interceptor, info, closed := sc.state()
+	if closed {
+		return net.ErrClosed
+	}
+	if interceptor == nil || info == nil {
 		return sc.conn.WriteControl(messageType, data, deadline)
 	}
-	newType, newData, drop := sc.interceptor.OnSend(sc.info, messageType, data)
+	newType, newData, drop := interceptor.OnSend(info, messageType, data)
 	if drop {
 		return nil
 	}
@@ -204,12 +229,24 @@ func (sc *SafeConn) WriteJSON(v interface{}) error {
 	return sc.writeFrame(websocket.TextMessage, buf.Bytes())
 }
 
+// Close tears the connection down without waiting for in-flight writes. Writes
+// hold mu while writing to the peer and have no deadline, so closing the socket
+// under mu would let a peer that stops reading block the forced shutdown (and
+// every lifecycle cleanup waiting on it) indefinitely. gorilla permits Close
+// concurrently with reads and writes; closing the socket makes the blocked
+// write return immediately.
 func (sc *SafeConn) Close() error {
-	sc.mu.Lock()
+	sc.stateMu.Lock()
 	interceptor, info := sc.interceptor, sc.info
-	sc.interceptor = nil // run OnClose exactly once
+	sc.interceptor, sc.info = nil, nil // run OnClose exactly once
+	alreadyClosed := sc.closed
+	sc.closed = true
+	sc.stateMu.Unlock()
+	if alreadyClosed {
+		return nil
+	}
+
 	err := sc.conn.Close()
-	sc.mu.Unlock()
 	if interceptor != nil && info != nil {
 		interceptor.OnClose(info)
 	}
@@ -237,8 +274,6 @@ func (sc *SafeConn) SetPingHandler(h func(string) error) {
 }
 
 func (sc *SafeConn) GetConn() *websocket.Conn {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
 	return sc.conn
 }
 

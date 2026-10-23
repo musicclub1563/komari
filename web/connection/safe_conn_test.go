@@ -438,6 +438,48 @@ func TestSafeConnReadLimitAllowsMessagesAtTheLimit(t *testing.T) {
 	}
 }
 
+// TestSafeConnCloseInterruptsBlockedWrite 验证 Close 不会排在持锁的阻塞写之后。
+// 写路径没有写超时，对端不读时 WriteMessage 会一直持锁；若 Close 仍去抢锁，
+// 强制关闭与后续资源清理都会永久挂起。
+func TestSafeConnCloseInterruptsBlockedWrite(t *testing.T) {
+	release := make(chan struct{})
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// 不读取任何帧，让客户端的写堵塞在 TCP 缓冲区上。
+		<-release
+	}))
+	defer server.Close()
+	defer close(release)
+
+	sc := dialEcho(t, server)
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- sc.WriteMessage(websocket.BinaryMessage, bytes.Repeat([]byte("x"), 64<<20))
+	}()
+
+	// 等写真正进入阻塞状态（循环回环的缓冲区很快会被填满）。
+	time.Sleep(200 * time.Millisecond)
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- sc.Close() }()
+	select {
+	case <-closeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close blocked behind an in-flight write")
+	}
+
+	select {
+	case <-writeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("blocked write was not interrupted by Close")
+	}
+}
+
 // TestSafeConnOnCloseOnce 验证 Close 只触发一次 OnClose。
 func TestSafeConnOnCloseOnce(t *testing.T) {
 	server := wsEchoServer(t)

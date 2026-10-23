@@ -74,30 +74,47 @@ var TerminalSessionsMutex = &sync.Mutex{}
 var TerminalSessions = make(map[string]*TerminalSession)
 
 // 与 v2 事件队列 TTL 对齐，被控端短暂离线后会话仍可恢复。
-const terminalSessionRetention = 5 * time.Minute
+const defaultTerminalSessionRetention = 5 * time.Minute
+
+// terminalSessionRetentionNanos 允许测试缩短挂起会话的保留期。
+// 0 表示使用默认值；用原子值避免后台定时器与测试之间产生竞态。
+var terminalSessionRetentionNanos atomic.Int64
+
+func terminalSessionRetention() time.Duration {
+	if n := terminalSessionRetentionNanos.Load(); n > 0 {
+		return time.Duration(n)
+	}
+	return defaultTerminalSessionRetention
+}
+
+// terminalForwardWaitNanos 允许测试缩短等待上一轮转发退出的上限。
+var terminalForwardWaitNanos atomic.Int64
+
+const defaultTerminalForwardWait = 2 * time.Second
+
+func terminalForwardWait() time.Duration {
+	if n := terminalForwardWaitNanos.Load(); n > 0 {
+		return time.Duration(n)
+	}
+	return defaultTerminalForwardWait
+}
 
 func scheduleCleanup(id string, session *TerminalSession) {
 	if session.CleanupTimer != nil {
 		session.CleanupTimer.Stop()
 	}
-	session.CleanupTimer = time.AfterFunc(terminalSessionRetention, func() {
-		var browser, agent *connection.SafeConn
-
+	session.CleanupTimer = time.AfterFunc(terminalSessionRetention(), func() {
 		TerminalSessionsMutex.Lock()
-		if current, ok := TerminalSessions[id]; !ok || current != session {
-			TerminalSessionsMutex.Unlock()
+		defer TerminalSessionsMutex.Unlock()
+		current, ok := TerminalSessions[id]
+		// 定时器可能已过期但回调阻塞在锁上，期间会话又被重新附着。此时
+		// 会话已重新活跃（Browser/Agent 非空），不能把它从表中删掉；否则
+		// 重连的终端会在保留期到期时被静默关闭。定时器被重新武装时
+		// （再次挂起）会重新检查状态。
+		if !ok || current != session || session.Browser != nil || session.Agent != nil {
 			return
 		}
-		browser, agent = session.Browser, session.Agent
 		delete(TerminalSessions, id)
-		TerminalSessionsMutex.Unlock()
-
-		if browser != nil {
-			_ = browser.Close()
-		}
-		if agent != nil {
-			_ = agent.Close()
-		}
 	})
 }
 
@@ -180,9 +197,10 @@ func attachBrowser(id, userUUID string, credential *terminalCredential, conn *co
 	// agent 收到后会重新连接。
 	session.Agent = nil
 	session.Forwarding = false
-	if oldBrowser != nil || oldAgent != nil {
-		stopCleanup(session)
-	}
+	// 重新附着使会话重新活跃，必须无条件取消挂起时武装的保留期定时器。
+	// 若只在替换旧连接时取消，挂起后只重连浏览器、agent 稍后才上线的
+	// 会话会在保留期到期时被定时器删除。
+	stopCleanup(session)
 	TerminalSessionsMutex.Unlock()
 	if oldBrowser != nil && oldBrowser != conn {
 		_ = oldBrowser.Close()
@@ -226,16 +244,23 @@ func maybeStartForwarding(id string) {
 	TerminalSessionsMutex.Unlock()
 
 	// 上一轮转发（通常因浏览器/agent 被替换而退出）必须先结束，避免新旧
-	// goroutine 并发读同一个 agent 连接。超时则放弃启动，等待下一次事件。
+	// goroutine 并发读同一个 agent 连接。
 	if previous != nil {
 		select {
 		case <-previous:
-		case <-time.After(2 * time.Second):
+		case <-time.After(terminalForwardWait()):
+			// 上一轮仍未退出。此时浏览器和 agent 都已附着，不会再有任何
+			// attach 事件触发重试；直接放弃会让终端永久失去转发。先释放
+			// Forwarding，等上一轮真正退出后再自动重试。
 			TerminalSessionsMutex.Lock()
 			if current, exists := TerminalSessions[id]; exists && current == session {
 				session.Forwarding = false
 			}
 			TerminalSessionsMutex.Unlock()
+			go func() {
+				<-previous
+				maybeStartForwarding(id)
+			}()
 			return
 		}
 	}
