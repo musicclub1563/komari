@@ -24,24 +24,14 @@ const (
 func IdentityMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		p := IdentifyPrincipal(c)
-		SetPrincipal(c, p)
+		// 身份主体与兼容键(role/uuid/api_key/session/client_uuid)统一由
+		// RefreshPrincipal 写入,长连接复核走同一路径。
+		RefreshPrincipal(c, p)
 
-		// 写入兼容字段。
-		c.Set("role", p.PrimaryRole())
-		switch p.Type {
-		case rpc.PrincipalAPIKey:
-			// 旧逻辑:API Key 时记录裸 key 与固定占位 uuid。
-			apiKey := c.GetHeader("Authorization")
-			c.Set("api_key", apiKey[len("Bearer "):])
-			c.Set("uuid", "00000000-0000-0000-0000-000000000000")
-		case rpc.PrincipalUser:
+		if p.Type == rpc.PrincipalUser {
 			if session, err := c.Cookie("session_token"); err == nil && session != "" {
-				c.Set("session", session)
 				accounts.UpdateLatest(session, c.Request.UserAgent(), c.ClientIP())
 			}
-			c.Set("uuid", p.UserUUID)
-		case rpc.PrincipalAgent:
-			c.Set("client_uuid", p.ClientUUID)
 		}
 
 		c.Next()

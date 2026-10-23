@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 	"github.com/komari-monitor/komari/database/accounts"
 	"github.com/komari-monitor/komari/internal/config"
 	"github.com/komari-monitor/komari/pkg/rpc"
@@ -107,14 +108,18 @@ func headerOrQueryTwoFACode(c *gin.Context) string {
 }
 
 func serveWebSocket(c *gin.Context) {
-	conn, err := api.UpgradeSafeConn(c, api.EnableWebSocketCompression)
+	conn, err := api.UpgradeSafeConnWithLimit(c, api.MaxRPCMessageBytes, api.EnableWebSocketCompression)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "Failed to upgrade to WebSocket." + err.Error()})
 		return
 	}
 	defer conn.Close()
 
-	meta := buildContextMeta(c)
+	// 握手时的身份只用于确定连接是否以已认证主体建立。后续每条消息都会按
+	// 当前凭据重新识别，不能把这份 meta 当作会话期内的授权凭据。
+	initial := buildContextMeta(c)
+	authenticated := isAuthenticatedPrincipal(initial.Principal)
+
 	for {
 		var req rpc.JsonRpcRequest
 		if err := conn.ReadJSON(&req); err != nil {
@@ -131,9 +136,35 @@ func serveWebSocket(c *gin.Context) {
 			conn.WriteJSON(jerr.ResponseWithID(req.ID))
 			continue
 		}
+
+		// 服务端凭据复核：IdentifyPrincipal 每次都会重新校验 API Key / 会话 /
+		// agent token，并绕过 gin.Context 中缓存的握手身份。撤销、注销或过期
+		// 后，已认证连接会被拒绝并要求重新建连，而不是继续沿用旧权限。
+		meta := buildLiveContextMeta(c)
+		if authenticated && !isAuthenticatedPrincipal(meta.Principal) {
+			conn.WriteJSON(rpc.ErrorResponse(req.ID, rpc.Unauthenticated, "credential is no longer valid", nil))
+			_ = conn.WriteControl(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "credential revoked"),
+				time.Now().Add(time.Second))
+			return
+		}
 		// 同步写：SafeConn 内部有锁，串行写避免响应乱序与并发竞态。
 		conn.WriteJSON(dispatchWithSensitive(context.Background(), c, meta, &req))
 	}
+}
+
+// isAuthenticatedPrincipal 判断主体是否通过了任一凭据校验。
+func isAuthenticatedPrincipal(p *rpc.Principal) bool {
+	return p != nil && p.Type != rpc.PrincipalAnonymous
+}
+
+// buildLiveContextMeta 在长连接上重建身份元数据。
+// 与 buildContextMeta 的差别是刻意不读取 gin.Context 中的 principal 缓存：
+// 该缓存由握手时的 IdentityMiddleware 写入，凭据失效后不会自动更新。
+func buildLiveContextMeta(c *gin.Context) *rpc.ContextMeta {
+	p := api.IdentifyPrincipal(c)
+	api.RefreshPrincipal(c, p)
+	return buildMetaFor(c, p)
 }
 
 func servePost(c *gin.Context) {
@@ -174,6 +205,15 @@ func buildContextMeta(c *gin.Context) *rpc.ContextMeta {
 	if p == nil {
 		p = api.IdentifyPrincipal(c)
 	}
+	return buildMetaFor(c, p)
+}
+
+// buildMetaFor 按给定主体构建一次调用的元数据。所有身份相关字段均从 p 与
+// 当前请求重新填充，调用方不得在连接级复用同一份 meta。
+func buildMetaFor(c *gin.Context, p *rpc.Principal) *rpc.ContextMeta {
+	if p == nil {
+		p = rpc.NewAnonymousPrincipal()
+	}
 
 	meta := &rpc.ContextMeta{
 		Principal:  p,
@@ -188,8 +228,12 @@ func buildContextMeta(c *gin.Context) *rpc.ContextMeta {
 		meta.UserUUID = p.UserUUID
 		if session, err := c.Cookie("session_token"); err == nil && session != "" {
 			meta.SessionToken = session
-			if user, err := accounts.GetUserBySession(session); err == nil {
-				meta.User = &user
+			// 复核会话本身(含过期清理)并确认它仍属于同一用户；GetUserBySession
+			// 不检查过期时间，直接使用会让已过期的会话拿到用户元数据。
+			if uuid, err := accounts.GetSession(session); err == nil && uuid == p.UserUUID {
+				if user, err := accounts.GetUserByUUID(uuid); err == nil {
+					meta.User = &user
+				}
 			}
 		}
 	case rpc.PrincipalAgent:
