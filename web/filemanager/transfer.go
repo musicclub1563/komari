@@ -164,8 +164,10 @@ func initRemoteUpload(c *gin.Context, clientUUID string) {
 		api.RespondError(c, http.StatusBadRequest, fmt.Sprintf("invalid request: %v", err))
 		return
 	}
-	request.Path = strings.TrimSpace(request.Path)
-	if request.Path == "" {
+	// 路径必须原样保留：末尾空格等字符是文件名的合法组成部分（例如
+	// "/tmp/report " 与 "/tmp/report" 是两个不同的文件）。这里只做空值校验，
+	// 不做任何裁剪或改写。
+	if strings.TrimSpace(request.Path) == "" {
 		api.RespondError(c, http.StatusBadRequest, "path is required")
 		return
 	}
@@ -474,8 +476,9 @@ func cancelUpload(c *gin.Context, clientUUID string) {
 
 func Download(c *gin.Context) {
 	clientUUID := c.Param("uuid")
-	path := strings.TrimSpace(c.Query("path"))
-	if clientUUID == "" || path == "" {
+	// 保留精确路径：只对空值做校验，不裁剪首尾空白。
+	path := c.Query("path")
+	if clientUUID == "" || strings.TrimSpace(path) == "" {
 		api.RespondError(c, http.StatusBadRequest, "uuid and path are required")
 		return
 	}
@@ -665,8 +668,9 @@ func parseSingleByteRange(value string, size int64) (int64, int64, bool) {
 
 func CreatePreviewToken(c *gin.Context) {
 	clientUUID := c.Param("uuid")
-	path := strings.TrimSpace(c.Query("path"))
-	if clientUUID == "" || path == "" {
+	// 保留精确路径：只对空值做校验，不裁剪首尾空白。
+	path := c.Query("path")
+	if clientUUID == "" || strings.TrimSpace(path) == "" {
 		api.RespondError(c, http.StatusBadRequest, "uuid and path are required")
 		return
 	}
