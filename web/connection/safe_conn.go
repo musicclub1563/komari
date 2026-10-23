@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"sync"
 	"time"
 
@@ -52,6 +53,11 @@ func Interceptor() FrameInterceptor { return frameInterceptor }
 // forever.
 var errTooManyDroppedFrames = errors.New("too many frames dropped by plugin hooks")
 
+// ErrMessageTooLarge is returned when an inbound message exceeds the limit set
+// with SetReadLimit. The limit is enforced while reading, so an oversized
+// payload is never fully buffered in memory.
+var ErrMessageTooLarge = errors.New("websocket message exceeds read limit")
+
 // maxConsecutiveDroppedFrames bounds the internal re-read loop.
 const maxConsecutiveDroppedFrames = 16
 
@@ -62,6 +68,8 @@ type SafeConn struct {
 	conn *websocket.Conn
 	mu   sync.Mutex
 	ID   int64
+
+	readLimit int64
 
 	interceptor FrameInterceptor
 	info        *ConnInfo
@@ -75,6 +83,19 @@ func NewSafeConn(conn *websocket.Conn) *SafeConn {
 	}
 }
 
+// SetReadLimit bounds the size of inbound messages. The limit applies to the
+// decoded payload: gorilla/websocket rejects oversized frames before
+// reassembly, and the reader wrapper in readLimitedMessage additionally counts
+// decompressed bytes. It must be called before the first read.
+func (sc *SafeConn) SetReadLimit(limit int64) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	sc.readLimit = limit
+	if limit > 0 {
+		sc.conn.SetReadLimit(limit)
+	}
+}
+
 // SetInterceptor attaches the hook provider and the connection identity. It
 // must be called before any frame is read or written.
 func (sc *SafeConn) SetInterceptor(info *ConnInfo, interceptor FrameInterceptor) {
@@ -84,12 +105,44 @@ func (sc *SafeConn) SetInterceptor(info *ConnInfo, interceptor FrameInterceptor)
 	sc.interceptor = interceptor
 }
 
+// readLimitedMessage reads one complete message through NextReader while
+// enforcing the configured limit. Reading through a bounded reader (instead of
+// ReadMessage followed by a length check) means an oversized message is
+// rejected before the whole payload is buffered. LimitReader counts the bytes
+// delivered after decompression, so compressed amplification is covered too.
+func (sc *SafeConn) readLimitedMessage() (int, []byte, error) {
+	messageType, reader, err := sc.conn.NextReader()
+	if err != nil {
+		return 0, nil, err
+	}
+	sc.mu.Lock()
+	limit := sc.readLimit
+	sc.mu.Unlock()
+	if limit <= 0 {
+		data, readErr := io.ReadAll(reader)
+		return messageType, data, readErr
+	}
+	data, readErr := io.ReadAll(io.LimitReader(reader, limit+1))
+	if readErr != nil {
+		return 0, nil, readErr
+	}
+	if int64(len(data)) > limit {
+		// Tell the peer why the connection is going away; gorilla only sends
+		// this automatically for the pre-decompression limit.
+		_ = sc.conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseMessageTooBig, "message too large"),
+			time.Now().Add(time.Second))
+		return 0, nil, ErrMessageTooLarge
+	}
+	return messageType, data, nil
+}
+
 // readFrame reads one frame and runs the wsMessage hook chain. Frames
 // dropped by hooks are transparently skipped, so callers only ever see
 // processed frames.
 func (sc *SafeConn) readFrame() (int, []byte, error) {
 	for dropped := 0; ; {
-		messageType, data, err := sc.conn.ReadMessage()
+		messageType, data, err := sc.readLimitedMessage()
 		if err != nil {
 			return 0, nil, err
 		}

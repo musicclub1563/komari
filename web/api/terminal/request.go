@@ -55,7 +55,7 @@ func RequestTerminal(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "Require WebSocket upgrade"})
 		return
 	}
-	conn, err := api.UpgradeSafeConn(c, api.EnableWebSocketCompression)
+	conn, err := api.UpgradeSafeConnWithLimit(c, api.MaxTerminalMessageBytes, api.EnableWebSocketCompression)
 	if err != nil {
 		return
 	}

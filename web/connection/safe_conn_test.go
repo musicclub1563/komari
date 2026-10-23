@@ -1,6 +1,7 @@
 package connection
 
 import (
+	"bytes"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -287,6 +288,153 @@ func TestSafeConnNoInterceptorZeroCost(t *testing.T) {
 	_, data, err := sc.ReadMessage()
 	if err != nil || string(data) != "plain" {
 		t.Fatalf("read = %q err %v", data, err)
+	}
+}
+
+// readLimitOutcome 是限量读取服务端观测到的结果。
+type readLimitOutcome struct {
+	messageType int
+	data        []byte
+	err         error
+}
+
+// newReadLimitServer upgrades one connection, installs limit on a SafeConn and
+// reports the first read. compress enables permessage-deflate negotiation.
+func newReadLimitServer(t *testing.T, limit int64, compress bool) (*httptest.Server, <-chan readLimitOutcome) {
+	t.Helper()
+	outcome := make(chan readLimitOutcome, 1)
+	upgrader := websocket.Upgrader{EnableCompression: compress, CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			outcome <- readLimitOutcome{err: err}
+			return
+		}
+		sc := NewSafeConn(raw)
+		defer sc.Close()
+		sc.SetReadLimit(limit)
+		mt, data, err := sc.ReadMessage()
+		outcome <- readLimitOutcome{messageType: mt, data: data, err: err}
+	}))
+	return server, outcome
+}
+
+func dialWithCompression(t *testing.T, server *httptest.Server, compress bool) *websocket.Conn {
+	t.Helper()
+	dialer := websocket.Dialer{EnableCompression: compress}
+	conn, _, err := dialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return conn
+}
+
+// TestSafeConnReadLimitRejectsOversizedMessage guards the reproduced bug where
+// an 8 MiB frame was fully buffered before any size check ran. The message is
+// fragmented by the client's 4 KiB write buffer, so this also covers
+// reassembly.
+func TestSafeConnReadLimitRejectsOversizedMessage(t *testing.T) {
+	const limit = 4096
+	server, outcome := newReadLimitServer(t, limit, false)
+	defer server.Close()
+	client := dialWithCompression(t, server, false)
+	defer client.Close()
+
+	payload := bytes.Repeat([]byte("A"), 8<<20)
+	go func() {
+		_ = client.WriteMessage(websocket.TextMessage, payload)
+	}()
+
+	select {
+	case got := <-outcome:
+		if got.err == nil {
+			t.Fatalf("server accepted an %d byte message with limit %d", len(got.data), limit)
+		}
+		if got.data != nil {
+			t.Fatalf("server buffered %d bytes before rejecting the message", len(got.data))
+		}
+		if !errors.Is(got.err, websocket.ErrReadLimit) && !errors.Is(got.err, ErrMessageTooLarge) {
+			t.Fatalf("server read error = %v, want a read limit error", got.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("server did not reject the oversized message")
+	}
+
+	// The connection must be torn down without consuming the rest of the
+	// message. While the client is still streaming 8 MiB a TCP reset can race
+	// with the 1009 close frame, so only a close frame with a different code is
+	// a failure.
+	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, _, err := client.ReadMessage()
+	if err == nil {
+		t.Fatal("connection stayed open after an oversized message")
+	}
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) && closeErr.Code != websocket.CloseMessageTooBig {
+		t.Fatalf("client close code = %d, want %d", closeErr.Code, websocket.CloseMessageTooBig)
+	}
+}
+
+// TestSafeConnReadLimitUsesDecompressedSize covers compressed amplification:
+// the compressed payload is far below the limit while the decoded message is
+// far above it. gorilla's SetReadLimit only sees wire bytes, so the bounded
+// reader must count decompressed data.
+func TestSafeConnReadLimitUsesDecompressedSize(t *testing.T) {
+	const limit = 64 << 10
+	server, outcome := newReadLimitServer(t, limit, true)
+	defer server.Close()
+	client := dialWithCompression(t, server, true)
+	defer client.Close()
+
+	payload := bytes.Repeat([]byte("a"), 1<<20)
+	go func() {
+		_ = client.WriteMessage(websocket.TextMessage, payload)
+	}()
+
+	select {
+	case got := <-outcome:
+		if !errors.Is(got.err, ErrMessageTooLarge) {
+			t.Fatalf("server read error = %v, want ErrMessageTooLarge", got.err)
+		}
+		if len(got.data) != 0 {
+			t.Fatalf("server buffered %d decoded bytes, want none", len(got.data))
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("server did not reject the decompressed oversized message")
+	}
+
+	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, _, err := client.ReadMessage()
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseMessageTooBig {
+		t.Fatalf("client close error = %v, want close code %d", err, websocket.CloseMessageTooBig)
+	}
+}
+
+// TestSafeConnReadLimitAllowsMessagesAtTheLimit keeps normal traffic working,
+// including compressed frames that stay within the limit.
+func TestSafeConnReadLimitAllowsMessagesAtTheLimit(t *testing.T) {
+	const limit = 64 << 10
+	server, outcome := newReadLimitServer(t, limit, true)
+	defer server.Close()
+	client := dialWithCompression(t, server, true)
+	defer client.Close()
+
+	payload := bytes.Repeat([]byte("b"), 32<<10)
+	if err := client.WriteMessage(websocket.TextMessage, payload); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-outcome:
+		if got.err != nil {
+			t.Fatalf("server rejected an in-limit message: %v", got.err)
+		}
+		if !bytes.Equal(got.data, payload) {
+			t.Fatalf("server read %d bytes, want %d", len(got.data), len(payload))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not read the in-limit message")
 	}
 }
 
