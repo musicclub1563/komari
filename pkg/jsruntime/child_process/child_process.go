@@ -208,16 +208,33 @@ func (m *Module) childOptions(vm *moejs.Runtime, value moejs.Value) childCommand
 	}
 	return options
 }
-func childExecCommand(command string, arguments []string, options childCommandOptions) (*exec.Cmd, context.CancelFunc) {
+// childCommandDeadline combines an explicit command timeout with the deadline
+// inherited from the running JavaScript call, keeping whichever comes first.
+// Both inputs are absolute points in time: recomputing a full duration here
+// would restart the budget and let a command outlive the call that started it.
+func childCommandDeadline(options childCommandOptions, inherited time.Time) time.Time {
+	deadline := inherited
+	if options.timeout > 0 {
+		explicit := time.Now().Add(options.timeout)
+		if deadline.IsZero() || explicit.Before(deadline) {
+			deadline = explicit
+		}
+	}
+	return deadline
+}
+
+func childExecCommand(command string, arguments []string, options childCommandOptions, deadline time.Time) (*exec.Cmd, context.CancelFunc) {
 	// Always create a cancellable context. Previously a command without an
 	// explicit timeout got a no-op cancel func, so maxBuffer overruns and
-	// runtime shutdown could not terminate it.
+	// runtime shutdown could not terminate it. A deadline inherited from the
+	// JavaScript call additionally cancels the command when Runtime.Call times
+	// out, even if the script never calls Runtime.Close.
 	var ctx context.Context
 	var cancel context.CancelFunc
-	if options.timeout > 0 {
-		ctx, cancel = context.WithTimeout(context.Background(), options.timeout)
-	} else {
+	if deadline.IsZero() {
 		ctx, cancel = context.WithCancel(context.Background())
+	} else {
+		ctx, cancel = context.WithDeadline(context.Background(), deadline)
 	}
 
 	var cmd *exec.Cmd
@@ -253,7 +270,7 @@ func (m *Module) childOutputLimit(options childCommandOptions) int {
 }
 func (m *Module) spawnChild(vm *moejs.Runtime, command string, arguments []string, options childCommandOptions) *engine.Object {
 	child := events.NewEmitter(vm)
-	cmd, cancel := childExecCommand(command, arguments, options)
+	cmd, cancel := childExecCommand(command, arguments, options, childCommandDeadline(options, time.Time{}))
 	cmd.Dir = options.cwd
 	cmd.Env = options.env
 	stdin, stdinErr := cmd.StdinPipe()
@@ -521,7 +538,7 @@ func (m *Module) execChild(vm *moejs.Runtime, command string, arguments []string
 	child := events.NewEmitter(vm)
 	_ = native.Set(vm, child, "pid", moejs.Undefined())
 	_ = native.Set(vm, child, "killed", false)
-	cmd, cancel := childExecCommand(command, arguments, options)
+	cmd, cancel := childExecCommand(command, arguments, options, childCommandDeadline(options, time.Time{}))
 	cmd.Dir, cmd.Env = options.cwd, options.env
 	outputLimit := m.childOutputLimit(options)
 	stdout := &childOutputBuffer{limit: outputLimit, stream: "stdout", cancel: cancel}
@@ -598,7 +615,11 @@ type childSyncResult struct {
 }
 
 func (m *Module) runChildSync(command string, arguments []string, options childCommandOptions) childSyncResult {
-	cmd, cancel := childExecCommand(command, arguments, options)
+	// Synchronous commands block the JavaScript turn, so they must also honour
+	// the deadline of that turn: a Runtime.Call timeout cancels the child even
+	// when the script never closes the runtime.
+	inherited, _ := m.runtime.Deadline()
+	cmd, cancel := childExecCommand(command, arguments, options, childCommandDeadline(options, inherited))
 	defer cancel()
 	cmd.Dir, cmd.Env = options.cwd, options.env
 	outputLimit := m.childOutputLimit(options)

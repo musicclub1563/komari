@@ -31,6 +31,13 @@ type Runtime struct {
 	resourceID      uint64
 	resources       map[uint64]func()
 	resourcesClosed bool
+
+	// deadline is the absolute deadline of the synchronous JavaScript turn
+	// currently running on the loop goroutine. Host modules (child_process)
+	// read it so their blocking work is tied to the call deadline instead of a
+	// freshly computed timeout that ignores elapsed time.
+	deadlineMu sync.RWMutex
+	deadline   time.Time
 }
 
 func New(loop *loop.EventLoop, timeout time.Duration) *Runtime {
@@ -76,7 +83,7 @@ func (r *Runtime) RunJob(vm *moe.Runtime, name string, job func() error) error {
 	if !r.ResourcesOpen() {
 		return nil
 	}
-	err := RunWithDeadline(vm, time.Now().Add(r.timeout), func() error {
+	err := r.RunWithDeadline(vm, time.Now().Add(r.timeout), func() error {
 		return r.RunTurn(vm, job)
 	})
 	if err != nil {
@@ -143,6 +150,30 @@ func (r *Runtime) CloseResources() {
 			close()
 		}
 	}
+}
+
+// Deadline reports the absolute deadline of the synchronous turn currently
+// executing on the loop goroutine. ok is false outside a bounded turn.
+func (r *Runtime) Deadline() (deadline time.Time, ok bool) {
+	r.deadlineMu.RLock()
+	defer r.deadlineMu.RUnlock()
+	return r.deadline, !r.deadline.IsZero()
+}
+
+// RunWithDeadline records deadline for the duration of fn, so host modules can
+// derive their own cancellation from the call's real remaining budget. Nested
+// runs restore the previous deadline instead of clearing it.
+func (r *Runtime) RunWithDeadline(vm *moe.Runtime, deadline time.Time, fn func() error) error {
+	r.deadlineMu.Lock()
+	previous := r.deadline
+	r.deadline = deadline
+	r.deadlineMu.Unlock()
+	defer func() {
+		r.deadlineMu.Lock()
+		r.deadline = previous
+		r.deadlineMu.Unlock()
+	}()
+	return RunWithDeadline(vm, deadline, fn)
 }
 
 // RunWithDeadline interrupts synchronous JavaScript that exceeds deadline.

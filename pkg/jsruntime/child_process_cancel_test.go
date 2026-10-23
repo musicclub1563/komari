@@ -54,6 +54,50 @@ func TestExecFileSyncMaxBufferTerminatesChild(t *testing.T) {
 	}
 }
 
+// TestRuntimeCallTimeoutCancelsSyncChild guards the reproduced bug: with a 50 ms
+// runtime timeout and no per-command timeout, Runtime.Call returned a timeout
+// but the synchronous child kept running and wrote its marker ~300 ms later
+// because it was only tied to the command's own timeout. Close was never called
+// in the reproduction.
+func TestRuntimeCallTimeoutCancelsSyncChild(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "timeout-marker.txt")
+	jsRuntime, err := New(`
+		function run(command, environment) {
+			require("child_process").execFileSync(
+				command,
+				["-test.run=^TestNodeChildProcessHelper$"],
+				{ env: environment }
+			);
+			return true;
+		}
+		function healthy() { return 6 * 7 === 42; }
+	`, Options{NodeJS: true, AllowExec: true, BaseDir: t.TempDir(), Console: io.Discard, Timeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer jsRuntime.Close()
+
+	started := time.Now()
+	if err := jsRuntime.Call("run", os.Args[0], helperEnvWithMarker("output-marker", marker)); err == nil {
+		t.Fatal("expected the call to time out")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("Call took %s to report the 50ms timeout", elapsed)
+	}
+
+	// The helper writes the marker 300 ms after it starts. Without tying the
+	// child to the call deadline the file appears even though Call already
+	// returned a timeout.
+	time.Sleep(700 * time.Millisecond)
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Fatal("synchronous child survived the Runtime.Call timeout and wrote its marker")
+	}
+
+	if err := jsRuntime.Call("healthy"); err != nil {
+		t.Fatalf("runtime was unusable after a call timeout: %v", err)
+	}
+}
+
 // TestRuntimeCloseTerminatesTimedOutSyncChild guards the reproduced 757 ms
 // Close delay: a synchronous child was not registered with the runtime, so
 // Close waited for the process to finish on its own.

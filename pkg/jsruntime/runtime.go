@@ -287,7 +287,7 @@ func New(script string, options Options) (*Runtime, error) {
 			initialized <- err
 			return
 		}
-		err := bridge.RunWithDeadline(vm, time.Now().Add(timeout), func() error {
+		err := host.RunWithDeadline(vm, time.Now().Add(timeout), func() error {
 			sourceName := "script.js"
 			if baseDir != "" {
 				sourceName = filepath.Join(baseDir, sourceName)
@@ -450,7 +450,7 @@ func (r *Runtime) HasFunction(name string) bool {
 	deadline := time.Now().Add(r.timeout)
 	if !r.loop.RunOnLoop(func(vm *moe.Runtime) {
 		callable := false
-		err := bridge.RunWithDeadline(vm, deadline, func() error {
+		err := r.host.RunWithDeadline(vm, deadline, func() error {
 			v, err := vm.Get(e.ObjectValue(vm.Realm().Global), name)
 			if err != nil {
 				return err
@@ -506,7 +506,7 @@ func (r *Runtime) call(name string, requireTruthy bool, args ...any) error {
 			finish(bridge.ErrExecutionTimeout)
 			return
 		}
-		err := bridge.RunWithDeadline(vm, deadline, func() (err error) {
+		err := r.host.RunWithDeadline(vm, deadline, func() (err error) {
 			defer func() {
 				if p := recover(); p != nil {
 					switch x := p.(type) {
