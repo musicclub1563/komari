@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	logger "github.com/komari-monitor/komari/utils/log"
 	"io"
 	"net"
@@ -23,17 +24,75 @@ import (
 	"github.com/komari-monitor/komari/web/filemanager"
 )
 
+// Agent v2 HTTP 上报的体积上限。
+//
+// 该通道承载 report / basic info / ping result / task result / file result /
+// event pull 等 JSON-RPC 消息；正常负载在几十 KB 量级，1 MiB 对含大量 GPU
+// 或进程条目的上报仍留有一个数量级的余量，并与 WebSocket Agent 通道的
+// MaxAgentMessageBytes 保持一致。
+const (
+	// MaxAgentRequestBodyBytes 限制网络传输（压缩后）的请求体字节数。
+	MaxAgentRequestBodyBytes int64 = 1 << 20
+	// MaxAgentDecompressedBodyBytes 限制 gzip 解压后的字节数，防止压缩炸弹。
+	MaxAgentDecompressedBodyBytes int64 = 1 << 20
+)
+
+// errAgentBodyTooLarge 表示上报体超过上限，调用方应返回 413。
+var errAgentBodyTooLarge = errors.New("agent request body exceeds limit")
+
+// countingReader 记录底层已读取的字节数，用于区分“压缩体本身超限”与
+// “压缩体损坏”。
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
 func readMaybeCompressedBody(r *http.Request) ([]byte, error) {
 	defer r.Body.Close()
+
+	// 先限制网络字节数：LimitReader 在读取过程中截断，因此分块传输或没有
+	// 可信 Content-Length 的请求同样受约束，不会先完整缓冲再检查。
+	wire := &countingReader{r: io.LimitReader(r.Body, MaxAgentRequestBodyBytes+1)}
+
 	if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
-		zr, err := gzip.NewReader(r.Body)
+		zr, err := gzip.NewReader(wire)
 		if err != nil {
+			if wire.n > MaxAgentRequestBodyBytes {
+				return nil, errAgentBodyTooLarge
+			}
 			return nil, err
 		}
 		defer zr.Close()
-		return io.ReadAll(zr)
+
+		// 再限制解压后的体积：压缩后很小、解压后超限时在读取到上限+1 时
+		// 立即停止，不会缓冲完整解压结果。
+		data, err := io.ReadAll(io.LimitReader(zr, MaxAgentDecompressedBodyBytes+1))
+		if err != nil {
+			if wire.n > MaxAgentRequestBodyBytes {
+				return nil, errAgentBodyTooLarge
+			}
+			return nil, err
+		}
+		if int64(len(data)) > MaxAgentDecompressedBodyBytes {
+			return nil, errAgentBodyTooLarge
+		}
+		return data, nil
 	}
-	return io.ReadAll(r.Body)
+
+	data, err := io.ReadAll(wire)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > MaxAgentRequestBodyBytes || wire.n > MaxAgentRequestBodyBytes {
+		return nil, errAgentBodyTooLarge
+	}
+	return data, nil
 }
 
 func bindV2Params[T any](raw any, target *T) error {
@@ -133,6 +192,10 @@ func handleV2RPC(uuid string, req v2.Request, allowWait bool) v2.Response {
 func UploadV2RPC(c *gin.Context) {
 	bytesBody, err := readMaybeCompressedBody(c.Request)
 	if err != nil {
+		if errors.Is(err, errAgentBodyTooLarge) {
+			c.JSON(http.StatusRequestEntityTooLarge, v2.Error(nil, -32000, "request body too large", nil))
+			return
+		}
 		c.JSON(http.StatusBadRequest, v2.Error(nil, -32700, "invalid compressed body", err.Error()))
 		return
 	}
