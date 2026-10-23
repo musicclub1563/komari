@@ -7,6 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/komari-monitor/komari/database/clients"
 	v2 "github.com/komari-monitor/komari/protocol/v2"
+	"github.com/komari-monitor/komari/pkg/rpc"
 	"github.com/komari-monitor/komari/utils"
 	logger "github.com/komari-monitor/komari/utils/log"
 	agent_runtime "github.com/komari-monitor/komari/web/agent"
@@ -17,11 +18,40 @@ func dispatchTerminalRequest(uuid, id string) bool {
 	return agent_runtime.DispatchV2Event(uuid, v2.MethodAgentTerminal, v2.TerminalRequestParams{RequestID: id})
 }
 
+// captureTerminalCredential 把当前请求的凭据固化成独立快照。
+//
+// 终端 handler 返回后 gin.Context 会被复用，后台转发 goroutine 不能持有它；
+// 同时授权必须能追溯到建立连接时实际使用的凭据，而不是 UserUUID（API Key
+// 共用占位 UUID，无法据此判断密钥是否已轮换）。
+func captureTerminalCredential(c *gin.Context) *terminalCredential {
+	p := api.IdentifyPrincipal(c)
+	switch p.Type {
+	case rpc.PrincipalAPIKey:
+		const bearerPrefix = "Bearer "
+		auth := c.GetHeader("Authorization")
+		if !strings.HasPrefix(auth, bearerPrefix) {
+			return nil
+		}
+		key := strings.TrimSpace(strings.TrimPrefix(auth, bearerPrefix))
+		if key == "" {
+			return nil
+		}
+		return &terminalCredential{apiKey: key}
+	case rpc.PrincipalUser:
+		token, err := c.Cookie("session_token")
+		if err != nil || token == "" {
+			return nil
+		}
+		return &terminalCredential{sessionToken: token, userUUID: p.UserUUID}
+	default:
+		return nil
+	}
+}
+
 func RequestTerminal(c *gin.Context) {
 	uuid := c.Param("uuid")
 	userUUID, _ := c.Get("uuid")
 	userID, _ := userUUID.(string)
-	_, isAPIKey := c.Get("api_key")
 	_, err := clients.GetClientByUUID(uuid)
 	if err != nil {
 		c.JSON(400, gin.H{
@@ -30,6 +60,15 @@ func RequestTerminal(c *gin.Context) {
 		})
 		return
 	}
+
+	// 在 handler 内固化凭据并立即校验一次；handler 返回后 gin.Context 会被
+	// 复用，后台转发 goroutine 只使用这个独立快照。
+	credential := captureTerminalCredential(c)
+	if credential == nil || !credential.valid() {
+		api.RespondError(c, http.StatusUnauthorized, "Credential is no longer valid")
+		return
+	}
+
 	id := strings.TrimSpace(c.Query("request_id"))
 	if id == "" {
 		// Only a new terminal request is a sensitive operation. Reattaching an
@@ -42,7 +81,8 @@ func RequestTerminal(c *gin.Context) {
 	} else {
 		TerminalSessionsMutex.Lock()
 		session := TerminalSessions[id]
-		allowed := session != nil && session.UUID == uuid && (isAPIKey || session.UserUUID == userID)
+		allowed := session != nil && session.UUID == uuid &&
+			(credential.apiKey != "" || session.UserUUID == userID)
 		TerminalSessionsMutex.Unlock()
 		if !allowed {
 			c.JSON(http.StatusNotFound, gin.H{"status": "error", "message": "Terminal session not found"})
@@ -61,7 +101,7 @@ func RequestTerminal(c *gin.Context) {
 	}
 
 	if id != "" {
-		session, ok := attachBrowser(id, userID, isAPIKey, conn)
+		session, ok := attachBrowser(id, userID, credential, conn)
 		if !ok || session.UUID != uuid {
 			conn.WriteMessage(1, []byte("Terminal session expired\n终端会话已过期\n"))
 			conn.Close()
@@ -93,6 +133,7 @@ func RequestTerminal(c *gin.Context) {
 		Browser:     conn,
 		Agent:       nil,
 		RequesterIp: c.ClientIP(),
+		Credential:  credential,
 	}
 
 	TerminalSessionsMutex.Lock()
