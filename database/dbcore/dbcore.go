@@ -352,50 +352,20 @@ func Close() error {
 func doInitialize() error {
 	var err error
 
-	// 在数据库初始化前执行：如果存在 ./data/backup.zip，则进行恢复逻辑
-	func() {
-		backupZipPath := filepath.Join(".", "data", "backup.zip")
-		if _, statErr := os.Stat(backupZipPath); statErr == nil {
-			// 4. 将当前数据快照保存到 ./data/backup/，并保留已有归档。
-			backupDir := filepath.Join(".", "data", "backup")
-			if err := os.MkdirAll(backupDir, 0755); err != nil {
-				logger.Errorf("dbcore", "[restore] failed to create backup dir: %v", err)
-			} else {
-				tsName := time.Now().UTC().Format("20060102-150405")
-				bakPath := filepath.Join(backupDir, fmt.Sprintf("pre-restore-%s.zip", tsName))
-				if zipErr := zipDirectoryExcluding("./data", bakPath, map[string]struct{}{backupZipPath: {}, backupDir: {}}); zipErr != nil {
-					logger.Errorf("dbcore", "[restore] failed to zip current data: %v", zipErr)
-				} else {
-					logger.Infof("dbcore", "[restore] current data zipped to %s", bakPath)
-				}
-			}
-
-			// 5. 删除数据文件，但保留归档目录和待恢复的 backup.zip。
-			if delErr := removeAllInDirExcept("./data", map[string]struct{}{backupZipPath: {}, backupDir: {}}); delErr != nil {
-				logger.Errorf("dbcore", "[restore] failed to cleanup data dir: %v", delErr)
-			}
-
-			// 6. 解压 ./data/backup.zip 到 ./data
-			if unzipErr := unzipToDir(backupZipPath, "./data"); unzipErr != nil {
-				logger.Errorf("dbcore", "[restore] failed to unzip backup into data: %v", unzipErr)
-			} else {
-				logger.Infof("dbcore", "[restore] backup.zip extracted to ./data")
-			}
-
-			// 7. 删除 ./data/backup.zip
-			if rmErr := os.Remove(backupZipPath); rmErr != nil {
-				logger.Errorf("dbcore", "[restore] failed to remove backup.zip: %v", rmErr)
-			} else {
-				logger.Infof("dbcore", "[restore] backup.zip removed")
-			}
-			// 8. 删除标记
-			if rmErr := os.Remove("./data/komari-backup-markup"); rmErr != nil {
-				logger.Errorf("dbcore", "[restore] failed to remove komari-backup-markup: %v", rmErr)
-			} else {
-				logger.Infof("dbcore", "[restore] komari-backup-markup removed")
-			}
+	// 在数据库初始化前执行：如果存在 ./data/backup.zip，则进行恢复逻辑。
+	// 恢复先在独立暂存目录完成全部校验，校验通过后才切换数据目录；失败时
+	// 直接中止启动，绝不静默初始化空库，也不删除待重试的 backup.zip。
+	backupZipPath := filepath.Join(".", "data", "backup.zip")
+	if _, statErr := os.Stat(backupZipPath); statErr == nil {
+		previousDir, restoreErr := restoreStagedBackup(backupZipPath, filepath.Join(".", "data"))
+		if restoreErr != nil {
+			return fmt.Errorf("failed to restore %s: %w (current data was left untouched; fix the backup and retry)", backupZipPath, restoreErr)
 		}
-	}()
+		if previousDir != "" {
+			logger.Infof("dbcore", "[restore] previous data kept at %s", previousDir)
+		}
+		logger.Infof("dbcore", "[restore] backup.zip validated and restored into ./data")
+	}
 
 	// 记录“打开数据库之前”komari.db 是否已存在，用于区分全新安装与旧版升级。
 	// 必须在（可能的）恢复逻辑之后、gorm.Open 之前采集：恢复会解压出旧库，
