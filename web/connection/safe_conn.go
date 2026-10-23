@@ -78,18 +78,44 @@ type SafeConn struct {
 
 	ID int64
 
-	readLimit   int64
-	interceptor FrameInterceptor
-	info        *ConnInfo
-	closed      bool
+	readLimit    int64
+	writeTimeout time.Duration
+	interceptor  FrameInterceptor
+	info         *ConnInfo
+	closed       bool
 }
+
+// defaultWriteTimeout bounds a single frame write. A peer that stops reading
+// must not keep a writer (and the connection lifecycle behind it) blocked
+// forever.
+const defaultWriteTimeout = 10 * time.Second
 
 func NewSafeConn(conn *websocket.Conn) *SafeConn {
 	return &SafeConn{
-		conn: conn,
-		mu:   sync.Mutex{},
-		ID:   time.Now().UnixNano(),
+		conn:         conn,
+		mu:           sync.Mutex{},
+		ID:           time.Now().UnixNano(),
+		writeTimeout: defaultWriteTimeout,
 	}
+}
+
+// SetWriteTimeout bounds writes issued through WriteMessage/WriteJSON. A
+// non-positive duration disables the deadline. It must be called before
+// concurrent writes start.
+func (sc *SafeConn) SetWriteTimeout(timeout time.Duration) {
+	sc.stateMu.Lock()
+	defer sc.stateMu.Unlock()
+	sc.writeTimeout = timeout
+}
+
+// WriteJSONWithDeadline encodes v and writes it through the frame hooks with an
+// explicit write deadline.
+func (sc *SafeConn) WriteJSONWithDeadline(v interface{}, deadline time.Time) error {
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(v); err != nil {
+		return err
+	}
+	return sc.writeFrameWithDeadline(websocket.TextMessage, buf.Bytes(), deadline)
 }
 
 // SetReadLimit bounds the size of inbound messages. The limit applies to the
@@ -174,11 +200,20 @@ func (sc *SafeConn) readFrame() (int, []byte, error) {
 // writeFrame runs the wsSend hook chain then writes one frame. A dropped
 // frame is silently skipped; a nil interceptor writes through immediately.
 func (sc *SafeConn) writeFrame(messageType int, data []byte) error {
+	return sc.writeFrameWithDeadline(messageType, data, sc.writeDeadline())
+}
+
+// writeFrameWithDeadline applies deadline (when non-zero) while holding the
+// write mutex, so concurrent writers cannot race on the connection deadline.
+func (sc *SafeConn) writeFrameWithDeadline(messageType int, data []byte, deadline time.Time) error {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	interceptor, info, closed := sc.state()
 	if closed {
 		return net.ErrClosed
+	}
+	if !deadline.IsZero() {
+		_ = sc.conn.SetWriteDeadline(deadline)
 	}
 	if interceptor == nil || info == nil {
 		return sc.conn.WriteMessage(messageType, data)
@@ -188,6 +223,16 @@ func (sc *SafeConn) writeFrame(messageType int, data []byte) error {
 		return nil
 	}
 	return sc.conn.WriteMessage(newType, newData)
+}
+
+// writeDeadline returns the configured per-write deadline.
+func (sc *SafeConn) writeDeadline() time.Time {
+	sc.stateMu.Lock()
+	defer sc.stateMu.Unlock()
+	if sc.writeTimeout <= 0 {
+		return time.Time{}
+	}
+	return time.Now().Add(sc.writeTimeout)
 }
 
 // state returns a consistent snapshot of the hook state. stateMu is never
