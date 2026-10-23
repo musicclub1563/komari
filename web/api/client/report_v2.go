@@ -234,6 +234,16 @@ func WebSocketV2RPC(c *gin.Context) {
 		conn.WriteJSON(v2.Error(nil, -32001, "invalid token", nil))
 		return
 	}
+	// 长连接不能一直沿用握手时的身份快照：后续每条消息都要用连接实际使用的
+	// token 重新查库，token 轮换或节点删除后旧连接立即失效。
+	agentToken := c.Query("token")
+	if agentToken == "" {
+		agentToken = c.Query("Authorization")
+	}
+	if !validateAgentToken(uuid, agentToken) {
+		conn.WriteJSON(v2.Error(nil, -32001, "invalid token", nil))
+		return
+	}
 	if oldConn, exists := agent_runtime.GetConnectedClients()[uuid]; exists {
 		go oldConn.Close()
 	}
@@ -258,6 +268,16 @@ func WebSocketV2RPC(c *gin.Context) {
 			} else if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				logger.Errorf("client-api", "Client %s v2 connection error: %v", uuid, err)
 			}
+			return
+		}
+		// 每条消息处理前重新校验实际凭据，而不是信任握手时的 UUID/token 快照。
+		// 这样 token 轮换或节点删除后，旧连接不能再写入 basicInfo/report/ping
+		// 等任何结果。
+		if !validateAgentToken(uuid, agentToken) {
+			conn.WriteJSON(v2.Error(nil, -32001, "invalid token", nil))
+			_ = conn.WriteControl(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "credential revoked"),
+				time.Now().Add(time.Second))
 			return
 		}
 		message = bytes.TrimSpace(message)
@@ -293,6 +313,16 @@ func pushQueuedV2Events(conn *connection.SafeConn, uuid string) bool {
 	}
 	agent_runtime.AckV2Events(uuid, ackIDs)
 	return true
+}
+
+// validateAgentToken 用数据库中的当前令牌重新确认长连接身份。token 被轮换
+// 或节点被删除后，旧连接持有的 token 不再解析到同一个 UUID。
+func validateAgentToken(uuid, token string) bool {
+	if uuid == "" || token == "" {
+		return false
+	}
+	current, err := clients.GetClientUUIDByToken(token)
+	return err == nil && current == uuid
 }
 
 func clientUUIDFromContext(c *gin.Context) (string, bool) {

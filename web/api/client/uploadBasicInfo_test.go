@@ -51,6 +51,13 @@ func TestV2BasicInfoFillsRegionFromGeoIP(t *testing.T) {
 
 	clientUUID := "client-v2-geoip"
 	now := time.Now().UTC()
+	// 共享内存库在重复运行（-count>1）时保留旧记录，先清理固定 UUID/token
+	// 的残留行，避免 UNIQUE 约束失败。
+	deleteClient := func() {
+		db.Where("uuid = ? OR token = ?", clientUUID, "token-v2-geoip").Delete(&models.Client{})
+	}
+	deleteClient()
+	t.Cleanup(deleteClient)
 	if err := db.Create(&models.Client{
 		UUID:      clientUUID,
 		Token:     "token-v2-geoip",

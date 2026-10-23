@@ -111,8 +111,17 @@ func adminEditClient(ctx context.Context, req *rpc.JsonRpcRequest) (any, *rpc.Js
 	if uuid == "" {
 		return nil, rpc.MakeError(rpc.InvalidParams, "Invalid or missing UUID", nil)
 	}
+	previous, err := clients.GetClientByUUID(uuid)
+	if err != nil {
+		return nil, rpc.MakeError(rpc.InvalidParams, "Client not found", nil)
+	}
 	if err := clients.SaveClient(update); err != nil {
 		return nil, rpc.MakeError(rpc.InternalError, err.Error(), nil)
+	}
+	// Token 轮换后旧 WebSocket 已无法通过逐消息复核，这里主动结束它，让
+	// agent 用新 token 重连，而不是等下一次上报才发现失效。
+	if current, err := clients.GetClientTokenByUUID(uuid); err == nil && current != previous.Token {
+		closeAgentConnection(uuid)
 	}
 	actor, ip := auditActor(ctx)
 	auditlog.Log(ip, actor, "edit client:"+uuid, "info")
@@ -133,9 +142,21 @@ func adminRemoveClient(ctx context.Context, req *rpc.JsonRpcRequest) (any, *rpc.
 	metricstore.DeleteEntityAsync(params.UUID)
 	actor, ip := auditActor(ctx)
 	auditlog.Log(ip, actor, "delete client:"+params.UUID, "warn")
+	closeAgentConnection(params.UUID)
 	agent_runtime.DeleteConnectedClients(params.UUID)
 	agent_runtime.DeleteLatestReport(params.UUID)
 	return nil, nil
+}
+
+// closeAgentConnection 结束该节点当前的 WebSocket 连接（若存在）。关闭后
+// handler 的 defer 会按连接代次清理在线状态，不会误删随后建立的新连接。
+func closeAgentConnection(uuid string) {
+	conn := agent_runtime.GetConnectedClients()[uuid]
+	if conn == nil {
+		return
+	}
+	_ = conn.Close()
+	agent_runtime.DeleteClientConditionally(uuid, conn)
 }
 
 func adminGetClient(_ context.Context, req *rpc.JsonRpcRequest) (any, *rpc.JsonRpcError) {
