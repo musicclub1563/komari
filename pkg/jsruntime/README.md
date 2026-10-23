@@ -705,6 +705,13 @@ function runtimeInfo() {
 | ChildProcess `kill/ref/unref/disconnect/send` | `部分实现` 或调用抛错，见下文 |
 
 支持的 options：`cwd`、`env`、`shell`、`timeout`、`encoding`、`maxBuffer`。
+
+> **shell 语义**：`exec`/`execSync`（以及 `shell: true` 的 `spawn`/`execFile`）
+> 会把 command 与 arguments 用空格拼接后交给 `/bin/sh -c` 或 `cmd.exe /d /s /c`，
+> 与 Node 一致。参数中的 shell 元字符会被解释执行，调用方不得把不可信输入拼进
+> 命令。非 shell 模式使用 `exec.Command(command, args...)` 直接传参，不经过 shell。
+> 整个模块（含 `process.kill`）要求 `AllowExec`，该能力需要管理员在插件权限审批
+> 中显式授予。
 `cwd` 受 `BaseDir` 限制；子进程默认不继承 runtime 的 `Timeout`，只有显式传入 `timeout` 时才会自动结束。
 请求的 `maxBuffer` 只能收紧 Go 侧全局上限，不能放大。
 `stdio/input/detached/uid/gid/windowsHide/windowsVerbatimArguments/serialization` 等未实现。
