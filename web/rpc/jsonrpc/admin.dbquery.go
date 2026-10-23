@@ -62,6 +62,9 @@ type databaseTablesResponse struct {
 }
 
 func init() {
+	// 原始 SQL 属于系统级能力：插件即使获批 allowSystemRPC 也不能调用。
+	rpc.MarkPluginForbidden("admin:dbQuery")
+	rpc.MarkPluginForbidden("admin:dbExec")
 	RegisterWithGroupAndMeta("dbQuery", rpc.RoleAdmin, adminDBQuery, &rpc.MethodMeta{
 		Name:    "admin:dbQuery",
 		Summary: "Execute a SQL query against the main or metrics database",
@@ -98,6 +101,13 @@ func adminDBQuery(ctx context.Context, req *rpc.JsonRpcRequest) (any, *rpc.JsonR
 	if rpcErr != nil {
 		return nil, rpcErr
 	}
+	// 查询入口只读：否则它可以绕过 dbExec 的写入语义与审计，直接修改数据。
+	if err := ensureReadOnlyStatement(statement); err != nil {
+		return nil, rpc.MakeError(rpc.InvalidParams, err.Error(), nil)
+	}
+
+	actor, ip := auditActor(ctx)
+	auditlog.Log(ip, actor, "query database SQL on "+target+": "+sqlAuditSummary(statement), "info")
 
 	response, err := queryDatabase(ctx, target, statement, params.Args, limit)
 	if err != nil {
@@ -121,7 +131,7 @@ func adminDBExec(ctx context.Context, req *rpc.JsonRpcRequest) (any, *rpc.JsonRp
 	}
 
 	actor, ip := auditActor(ctx)
-	auditlog.Log(ip, actor, "execute database SQL on "+target, "warn")
+	auditlog.Log(ip, actor, "execute database SQL on "+target+": "+sqlAuditSummary(statement), "warn")
 
 	result, driver, err := executeDatabase(ctx, target, statement, params.Args)
 	if err != nil {
@@ -159,6 +169,275 @@ func adminDBTables(ctx context.Context, req *rpc.JsonRpcRequest) (any, *rpc.Json
 		return nil, rpc.MakeError(rpc.InternalError, "Failed to list database tables: "+err.Error(), nil)
 	}
 	return response, nil
+}
+
+// readOnlyStatementPrefixes 是 dbQuery 允许的首个关键字。WITH 与 PRAGMA 刻意
+// 不在其中：CTE 可以以 DELETE/UPDATE 结尾，部分 PRAGMA 会写入数据库。
+var readOnlyStatementPrefixes = map[string]struct{}{
+	"SELECT":   {},
+	"EXPLAIN":  {},
+	"SHOW":     {},
+	"DESCRIBE": {},
+	"DESC":     {},
+}
+
+// writeStatementKeywords 只要作为独立词元出现就拒绝。它们大多是 SQL 保留字，
+// 正常只读查询不会命中，覆盖：EXPLAIN 后面的写入语句（PostgreSQL 的 EXPLAIN
+// ANALYZE 会真正执行语句）、SELECT ... INTO / OUTFILE / DUMPFILE、SQLite 的
+// load_extension、MySQL 的 LOAD_FILE，以及 PostgreSQL 的运维函数。
+// REPLACE 刻意不在其中：它是常用字符串函数，而 REPLACE INTO 会被首个关键字
+// 检查拦下。
+var writeStatementKeywords = map[string]struct{}{
+	"INSERT": {}, "UPDATE": {}, "DELETE": {}, "MERGE": {},
+	"CREATE": {}, "ALTER": {}, "DROP": {}, "TRUNCATE": {}, "RENAME": {},
+	"GRANT": {}, "REVOKE": {},
+	"INTO": {}, "OUTFILE": {}, "DUMPFILE": {},
+	"ATTACH": {}, "DETACH": {}, "PRAGMA": {}, "VACUUM": {}, "REINDEX": {},
+	"LOCK": {},
+	"LOAD_FILE": {}, "LOAD_EXTENSION": {},
+	"PG_TERMINATE_BACKEND": {}, "PG_CANCEL_BACKEND": {},
+	"PG_RELOAD_CONF": {}, "PG_ROTATE_LOGFILE": {},
+	"PG_SWITCH_WAL": {}, "PG_CREATE_RESTORE_POINT": {},
+}
+
+// ensureReadOnlyStatement rejects statements that can modify data or files
+// through the query endpoint. It is a conservative lexical check, not a SQL
+// parser: comments, string literals and quoted identifiers are removed first,
+// the remaining text is tokenised, and anything not recognisable as a read-only
+// query is refused. Statements are also limited to one, because a second
+// statement turns a query into an arbitrary write.
+//
+// Residual risk is documented rather than hidden: a read-only SELECT can still
+// call database functions with side effects (user-defined functions,
+// pg_sleep), and the check may reject unusual but harmless syntax. The real
+// boundary is the admin role plus the plugin call guard.
+func ensureReadOnlyStatement(statement string) error {
+	code, err := rewriteSQL(statement, "''", false)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(code) == "" {
+		return fmt.Errorf("sql is required")
+	}
+	// 结尾的空语句分隔符无害，中间出现分号则是多语句。
+	if body := strings.TrimRight(strings.TrimSpace(code), ";\r\n\t "); strings.Contains(body, ";") {
+		return fmt.Errorf("dbQuery accepts a single statement")
+	}
+	tokens := sqlTokens(code)
+	if len(tokens) == 0 {
+		return fmt.Errorf("sql is required")
+	}
+	if _, ok := readOnlyStatementPrefixes[tokens[0]]; !ok {
+		return fmt.Errorf("dbQuery accepts read-only statements only (SELECT/EXPLAIN/SHOW/DESCRIBE); use dbExec for writes")
+	}
+	// PostgreSQL/MySQL 8 的 EXPLAIN ANALYZE 会执行被解释的语句。
+	if tokens[0] == "EXPLAIN" && containsSQLToken(tokens, "ANALYZE") {
+		return fmt.Errorf("dbQuery does not allow EXPLAIN ANALYZE: it executes the statement")
+	}
+	// SHOW CREATE TABLE/VIEW/... 是只读的：CREATE 是 SHOW 的子命令。
+	showCreate := tokens[0] == "SHOW" && len(tokens) > 1 && tokens[1] == "CREATE"
+	for index, token := range tokens {
+		if showCreate && index == 1 {
+			continue
+		}
+		if _, blocked := writeStatementKeywords[token]; blocked {
+			return fmt.Errorf("dbQuery does not allow the %s keyword; only read-only queries are permitted", token)
+		}
+	}
+	return nil
+}
+
+func containsSQLToken(tokens []string, name string) bool {
+	for _, token := range tokens {
+		if token == name {
+			return true
+		}
+	}
+	return false
+}
+
+// sqlTokens splits sanitized SQL into upper-case word tokens.
+func sqlTokens(code string) []string {
+	tokens := make([]string, 0, 16)
+	for index := 0; index < len(code); {
+		if !isSQLWordByte(code[index]) {
+			index++
+			continue
+		}
+		start := index
+		for index < len(code) && isSQLWordByte(code[index]) {
+			index++
+		}
+		tokens = append(tokens, strings.ToUpper(code[start:index]))
+	}
+	return tokens
+}
+
+func isSQLWordByte(b byte) bool {
+	return b == '_' || (b >= '0' && b <= '9') || (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
+}
+
+// rewriteSQL returns a copy of statement with ordinary comments removed and the
+// content of string literals, quoted identifiers and PostgreSQL dollar-quoted
+// strings replaced by literalPlaceholder. When redactNumbers is set, numeric
+// literals become "?" as well.
+//
+// Backslash escapes are deliberately not honoured: MySQL interprets them and
+// standard SQL does not, and ending a literal early only makes the keyword
+// check stricter. MySQL executable comments ("/*! ... */") keep their content,
+// because the server executes what is inside them.
+func rewriteSQL(statement, literalPlaceholder string, redactNumbers bool) (string, error) {
+	var out strings.Builder
+	out.Grow(len(statement) + 8)
+	executableEnd := -1
+	for index := 0; index < len(statement); {
+		if executableEnd >= 0 && index >= executableEnd {
+			index += 2 // closing */ of an executable comment
+			executableEnd = -1
+			continue
+		}
+		c := statement[index]
+		switch {
+		case c == '-' && strings.HasPrefix(statement[index:], "--"):
+			index = skipSQLLine(statement, index)
+			out.WriteByte(' ')
+		case c == '/' && strings.HasPrefix(statement[index:], "/*"):
+			start := index + 2
+			executable := start < len(statement) && statement[start] == '!'
+			if executable {
+				start++
+			}
+			end := strings.Index(statement[start:], "*/")
+			if end < 0 {
+				return "", fmt.Errorf("unterminated SQL comment")
+			}
+			if executable {
+				out.WriteByte(' ')
+				executableEnd = start + end
+				index = start
+				continue
+			}
+			index = start + end + 2
+			out.WriteByte(' ')
+		case c == '\'' || c == '"' || c == '`':
+			next, err := skipSQLLiteral(statement, index)
+			if err != nil {
+				return "", err
+			}
+			out.WriteString(literalPlaceholder)
+			index = next
+		case c == '$':
+			next, quoted, err := skipSQLDollarQuoted(statement, index)
+			if err != nil {
+				return "", err
+			}
+			if !quoted {
+				out.WriteByte(c)
+				index++
+				continue
+			}
+			out.WriteString(literalPlaceholder)
+			index = next
+		case redactNumbers && c >= '0' && c <= '9' && (index == 0 || !isSQLWordByte(statement[index-1])):
+			index = skipSQLNumber(statement, index)
+			out.WriteByte('?')
+		default:
+			out.WriteByte(c)
+			index++
+		}
+	}
+	return out.String(), nil
+}
+
+func skipSQLLine(statement string, index int) int {
+	for index < len(statement) && statement[index] != '\n' {
+		index++
+	}
+	return index
+}
+
+func skipSQLLiteral(statement string, index int) (int, error) {
+	quote := statement[index]
+	index++
+	for index < len(statement) {
+		if statement[index] != quote {
+			index++
+			continue
+		}
+		// A doubled quote is an escaped quote, not the end of the literal.
+		if index+1 < len(statement) && statement[index+1] == quote {
+			index += 2
+			continue
+		}
+		return index + 1, nil
+	}
+	return 0, fmt.Errorf("unterminated quoted text in SQL")
+}
+
+// skipSQLDollarQuoted skips a PostgreSQL dollar-quoted string such as $$...$$ or
+// $tag$...$tag$. Standalone "$" characters (MySQL identifiers, placeholders)
+// are reported as not quoted so the caller can keep scanning normally.
+func skipSQLDollarQuoted(statement string, index int) (int, bool, error) {
+	tagEnd := index + 1
+	for tagEnd < len(statement) && statement[tagEnd] != '$' {
+		b := statement[tagEnd]
+		if !(b == '_' || (b >= '0' && b <= '9') || (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')) {
+			return 0, false, nil
+		}
+		tagEnd++
+	}
+	if tagEnd >= len(statement) {
+		return 0, false, nil
+	}
+	tag := statement[index : tagEnd+1]
+	offset := strings.Index(statement[tagEnd+1:], tag)
+	if offset < 0 {
+		return 0, false, fmt.Errorf("unterminated dollar-quoted string in SQL")
+	}
+	return tagEnd + 1 + offset + len(tag), true, nil
+}
+
+func skipSQLNumber(statement string, index int) int {
+	for index < len(statement) {
+		c := statement[index]
+		switch {
+		case (c >= '0' && c <= '9') || c == '.' || c == '_':
+			index++
+		case c == 'e' || c == 'E':
+			next := index + 1
+			if next < len(statement) && (statement[next] == '+' || statement[next] == '-') {
+				next++
+			}
+			if next < len(statement) && statement[next] >= '0' && statement[next] <= '9' {
+				index = next
+				continue
+			}
+			return index
+		default:
+			return index
+		}
+	}
+	return index
+}
+
+// sqlAuditSummary renders a bounded, redacted one-line summary for the audit
+// log: comments are dropped, literal values (including numbers) become "?", and
+// the result is truncated. Bound parameters and result rows are never part of
+// the summary, so credentials and query results cannot leak into the log.
+func sqlAuditSummary(statement string) string {
+	const limit = 160
+	redacted, err := rewriteSQL(statement, "?", true)
+	if err != nil {
+		return "(unparsable statement)"
+	}
+	normalized := strings.Join(strings.Fields(redacted), " ")
+	if normalized == "" {
+		return "(empty statement)"
+	}
+	if len(normalized) > limit {
+		return normalized[:limit] + "…"
+	}
+	return normalized
 }
 
 func parseDatabaseQueryParams(req *rpc.JsonRpcRequest) (databaseQueryParams, string, string, int, *rpc.JsonRpcError) {

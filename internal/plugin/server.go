@@ -17,6 +17,7 @@ import (
 	"github.com/Calcium-Ion/moejs"
 	"github.com/Calcium-Ion/moejs/engine"
 	"github.com/gin-gonic/gin"
+	"github.com/komari-monitor/komari/database/auditlog"
 	"github.com/komari-monitor/komari/database/models"
 	"github.com/komari-monitor/komari/pkg/jsruntime"
 	"github.com/komari-monitor/komari/pkg/jsruntime/httpbody"
@@ -71,6 +72,18 @@ import (
 //
 // The host engine keeps a registered route slot after unload; requests then
 // receive 404 until the plugin is loaded again.
+// pluginCallGuard is the admission check for server.call. Plugins run
+// untrusted code installed from a ZIP, so even an approved allowSystemRPC must
+// not grant raw database access or sensitive operations: those stay reachable
+// only through the HTTP/WebSocket transport by the administrator (sensitive
+// methods still require the second factor).
+func pluginCallGuard(method string) error {
+	if rpc.IsPluginForbidden(method) || rpc.IsSensitive(method) {
+		return fmt.Errorf("server.call cannot invoke %q from a plugin", method)
+	}
+	return nil
+}
+
 func (m *Manager) registerServerModule(host *jsruntime.Host, registry *require.Registry, inst *Instance) {
 	registry.RegisterNativeModule("server", func(vm *moejs.Runtime, module *engine.Object) {
 		exports := vm.Realm().NewObject()
@@ -140,6 +153,15 @@ func (m *Manager) registerServerModule(host *jsruntime.Host, registry *require.R
 						_ = reject(native.GoError(vm, errors.New("server.call requires the \"system RPC\" permission (allowSystemRPC)")))
 					})
 					return
+				}
+				if err := pluginCallGuard(method); err != nil {
+					host.RunOnLoop(func(vm *moejs.Runtime) {
+						_ = reject(native.GoError(vm, err))
+					})
+					return
+				}
+				if strings.HasPrefix(method, "admin:") {
+					auditlog.Log("", "plugin:"+inst.info.Short, "plugin called RPC "+method, "info")
 				}
 				meta := &rpc.ContextMeta{Permission: rpc.RoleAdmin, Principal: rpc.PrincipalFromRole(rpc.RoleAdmin)}
 				ctx := rpc.NewContextWithMeta(context.Background(), meta)
