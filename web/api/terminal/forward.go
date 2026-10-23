@@ -144,8 +144,13 @@ func forwardTerminal(id string, browser, agent *connection.SafeConn, done chan s
 	}()
 
 	// 等待错误或主动关闭
-	<-errChan
+	fatalErr := <-errChan
 	close(stop)
+	if errors.Is(fatalErr, errTerminalCredentialRevoked) {
+		// 复用既有的终端关闭指令，尽量让 agent 终止远端 PTY。agent 侧最终
+		// 是否结束 Shell 取决于 agent 实现，关闭 WebSocket 本身不保证这一点。
+		_ = agent.WriteJSON(gin.H{"type": "close"})
+	}
 	suspendSession(id, browser, agent)
 	// 等所有 goroutine 退出后再关闭 done，确保下一轮转发不会并发读 agent。
 	wg.Wait()

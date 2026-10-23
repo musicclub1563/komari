@@ -222,15 +222,21 @@ func expectBrowserClosed(t *testing.T, conn *websocket.Conn) {
 // usable connection after revocation.
 func expectNoForwarding(t *testing.T, conn *websocket.Conn, marker string) {
 	t.Helper()
-	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
-	_, data, err := conn.ReadMessage()
-	if err == nil {
+	deadline := time.Now().Add(time.Second)
+	for {
+		_ = conn.SetReadDeadline(deadline)
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			// Either the read timed out (nothing was forwarded) or the
+			// connection was closed by the revocation path; both are correct.
+			return
+		}
+		// The revocation path may send the existing {"type":"close"} control
+		// frame before closing; it is not forwarded user input.
+		if strings.Contains(string(data), `"type":"close"`) {
+			continue
+		}
 		t.Fatalf("agent received %q after revocation, want no forwarding", data)
-	}
-	// Either the read timed out (nothing was forwarded) or the connection was
-	// closed by the revocation path; both are correct.
-	if netErr, ok := err.(net.Error); ok && !netErr.Timeout() {
-		return
 	}
 }
 
