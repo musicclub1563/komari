@@ -350,6 +350,7 @@ func TestConfigurationSaveAndGet(t *testing.T) {
 // string->""），已保存的 key 保留保存值。
 func TestGetConfigurationMergesManifestDefaults(t *testing.T) {
 	withTempDataDir(t)
+	resetPluginConfiguration(t, "cfg")
 	zipPath := writePluginZip(t, map[string]string{
 		"komari-plugin.json": `{"name":"Cfg","short":"cfg","version":"1.0.0","configuration":{"type":"managed","data":[
 			{"key":"greeting","name":"Greeting","type":"string","default":"Hello"},
@@ -403,6 +404,8 @@ func TestGetConfigurationMergesManifestDefaults(t *testing.T) {
 
 func TestGetConfigurationResolvesSelectorValues(t *testing.T) {
 	withTempDataDir(t)
+	resetPluginConfiguration(t, "cfg")
+	resetSelectorFixture(t)
 	if err := dbcore.GetDBInstance().Create(&models.Client{UUID: "node-a"}).Error; err != nil {
 		t.Fatal(err)
 	}

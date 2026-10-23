@@ -8,6 +8,7 @@ import (
 
 	"github.com/komari-monitor/komari/cmd/flags"
 	"github.com/komari-monitor/komari/database/dbcore"
+	"github.com/komari-monitor/komari/database/models"
 )
 
 func TestMain(m *testing.M) {
@@ -41,6 +42,29 @@ func withTempDataDir(t *testing.T) {
 		StorageDir = oldStorage
 		global = oldGlobal
 	})
+}
+
+// resetPluginConfiguration removes persisted plugin configuration so repeated
+// runs (-count>1) start from the manifest defaults again.
+func resetPluginConfiguration(t *testing.T, shorts ...string) {
+	t.Helper()
+	if err := dbcore.GetDBInstance().Where("short IN ?", shorts).
+		Delete(&models.PluginConfiguration{}).Error; err != nil {
+		t.Fatalf("reset plugin configuration: %v", err)
+	}
+}
+
+// resetSelectorFixture removes the fixed client and ping task rows used by the
+// selector configuration tests so repeated runs can create them again.
+func resetSelectorFixture(t *testing.T) {
+	t.Helper()
+	db := dbcore.GetDBInstance()
+	if err := db.Where("uuid = ?", "node-a").Delete(&models.Client{}).Error; err != nil {
+		t.Fatalf("reset clients: %v", err)
+	}
+	if err := db.Where("id = ?", 8).Delete(&models.PingTask{}).Error; err != nil {
+		t.Fatalf("reset ping tasks: %v", err)
+	}
 }
 
 // writePluginZip creates a plugin ZIP from a name -> content map.
