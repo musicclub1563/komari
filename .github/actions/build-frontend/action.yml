@@ -11,7 +11,7 @@ inputs:
   ref:
     description: >-
       komari-web commit SHA, branch, or tag to build. Leave empty to use the
-      pinned commit that contains the dependency security fixes.
+      pinned commit recorded in the resolve step below.
     default: ""
   artifact-name:
     description: Optional artifact name for the packed frontend theme.
@@ -55,7 +55,9 @@ runs:
         # Single source of truth for the verified komari-web commit. Keeping it
         # here means an empty ref still builds the pinned frontend instead of
         # falling back to the repository default branch.
-        PINNED_REF: "e7b8d9dad4fab2cfdda65b2623bc08fc304c3d81"
+        # radix head: svg icon XSS fix, HTML sanitisation, PWA cache of
+        # authenticated responses removed, office preview consent.
+        PINNED_REF: "b5ba6ded6e903f60e813f89e97c07c90579df333"
         INPUT_REF: ${{ inputs.ref }}
         REPO: ${{ inputs.repository }}
       run: |
