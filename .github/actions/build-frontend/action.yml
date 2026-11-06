@@ -56,8 +56,9 @@ runs:
         # here means an empty ref still builds the pinned frontend instead of
         # falling back to the repository default branch.
         # radix head: svg icon XSS fix, HTML sanitisation, PWA cache of
-        # authenticated responses removed, office preview consent.
-        PINNED_REF: "b5ba6ded6e903f60e813f89e97c07c90579df333"
+        # authenticated responses removed, office preview consent, plugin
+        # settings layout fix, warning before deleting the active theme.
+        PINNED_REF: "0c1af822e1fe723ac9a8a384e293c6f3c0971f83"
         INPUT_REF: ${{ inputs.ref }}
         REPO: ${{ inputs.repository }}
       run: |
