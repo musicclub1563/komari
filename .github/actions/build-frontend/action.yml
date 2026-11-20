@@ -59,8 +59,8 @@ runs:
         # authenticated responses removed, office preview consent, plugin
         # settings layout fix, warning before deleting the active theme,
         # global animation redesign and the terminal/editor overhaul that
-        # followed it.
-        PINNED_REF: "d4e36bf8f750d765ad984e57e3e37587c3543b2b"
+        # followed it, plus the dependency bumps that cleared npm audit.
+        PINNED_REF: "f81d91cb5d3b55a975bf8953e22ac7d10251e376"
         INPUT_REF: ${{ inputs.ref }}
         REPO: ${{ inputs.repository }}
       run: |
