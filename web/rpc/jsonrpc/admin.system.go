@@ -3,6 +3,7 @@ package jsonrpc
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -35,6 +36,7 @@ func init() {
 			{Name: "limit", Type: "string", Description: "Page size (default 100)"},
 			{Name: "page", Type: "string", Description: "One-based page number (default 1)"},
 			{Name: "msg_type", Type: "string", Description: "Optional exact message type filter"},
+			{Name: "q", Type: "string", Description: "Optional message, IP, or UUID search"},
 		},
 		Returns: "{ logs: Log[], total: number }",
 	})
@@ -51,6 +53,7 @@ func adminGetLogs(_ context.Context, req *rpc.JsonRpcRequest) (any, *rpc.JsonRpc
 		Limit   string `json:"limit"`
 		Page    string `json:"page"`
 		MsgType string `json:"msg_type"`
+		Query   string `json:"q"`
 	}
 	req.BindParams(&params)
 	if params.Limit == "" {
@@ -68,19 +71,19 @@ func adminGetLogs(_ context.Context, req *rpc.JsonRpcRequest) (any, *rpc.JsonRpc
 		return nil, rpc.MakeError(rpc.InvalidParams, "Invalid page: "+params.Page, nil)
 	}
 	db := dbcore.GetDBInstance()
-	logs, total, err := queryAdminLogs(db, limitInt, pageInt, params.MsgType)
+	logs, total, err := queryAdminLogs(db, limitInt, pageInt, params.MsgType, params.Query)
 	if err != nil {
 		return nil, rpc.MakeError(rpc.InternalError, "Failed to retrieve logs: "+err.Error(), nil)
 	}
 	return map[string]any{"logs": logs, "total": total}, nil
 }
 
-func queryAdminLogs(db *gorm.DB, limit, page int, msgType string) ([]models.Log, int64, error) {
+func queryAdminLogs(db *gorm.DB, limit, page int, msgType, search string) ([]models.Log, int64, error) {
 	var logs []models.Log
 	var total int64
 	offset := (page - 1) * limit
-	countQuery := filterAdminLogsByMessageType(db.Model(&models.Log{}), msgType)
-	logsQuery := filterAdminLogsByMessageType(db.Model(&models.Log{}), msgType)
+	countQuery := filterAdminLogs(db.Model(&models.Log{}), msgType, search)
+	logsQuery := filterAdminLogs(db.Model(&models.Log{}), msgType, search)
 	if err := countQuery.Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
@@ -90,9 +93,27 @@ func queryAdminLogs(db *gorm.DB, limit, page int, msgType string) ([]models.Log,
 	return logs, total, nil
 }
 
+func filterAdminLogs(query *gorm.DB, msgType, search string) *gorm.DB {
+	query = filterAdminLogsByMessageType(query, msgType)
+	return filterAdminLogsBySearch(query, search)
+}
+
 func filterAdminLogsByMessageType(query *gorm.DB, msgType string) *gorm.DB {
 	if msgType = strings.TrimSpace(msgType); msgType != "" {
 		return query.Where("msg_type = ?", msgType)
+	}
+	return query
+}
+
+func filterAdminLogsBySearch(query *gorm.DB, search string) *gorm.DB {
+	if search = strings.TrimSpace(search); search != "" {
+		pattern := "%" + search + "%"
+		return query.Where(
+			"message LIKE ? OR ip LIKE ? OR uuid LIKE ?",
+			pattern,
+			pattern,
+			pattern,
+		)
 	}
 	return query
 }
@@ -144,7 +165,22 @@ func adminExec(ctx context.Context, req *rpc.JsonRpcRequest) (any, *rpc.JsonRpcE
 		agent_runtime.DispatchV2Event(uuid, v2.MethodAgentExec, v2.ExecParams{TaskID: taskId, Command: params.Command})
 	}
 	actor, ip := auditActor(ctx)
-	auditlog.Log(ip, actor, "REC, task id: "+taskId, "warn")
+	dispatched := append(append([]string{}, onlineClients...), queuedClients...)
+	dispatchedFormatted := auditlog.FormatClientUUIDs(dispatched)
+	offlineFormatted := auditlog.FormatClientUUIDs(offlineClients)
+	execSummary := fmt.Sprintf(
+		"Remote exec: task_id=%s, targets=%d (online=%d, queued=%d, offline=%d)",
+		taskId, len(taskClients), len(onlineClients), len(queuedClients), len(offlineClients),
+	)
+	execDetails := make([]string, 0, 3)
+	if clientsLine := auditlog.JoinLabels(dispatchedFormatted); clientsLine != "" {
+		execDetails = append(execDetails, "Clients: "+clientsLine)
+	}
+	if offlineLine := auditlog.JoinLabels(offlineFormatted); offlineLine != "" {
+		execDetails = append(execDetails, "Offline: "+offlineLine)
+	}
+	execDetails = append(execDetails, "Command: "+auditlog.Truncate(strings.TrimSpace(params.Command), 2000))
+	auditlog.Log(ip, actor, auditlog.JoinLines(execSummary, execDetails...), "warn")
 	if len(offlineClients) > 0 {
 		for _, uuid := range offlineClients {
 			tasks.SaveTaskResult(taskId, uuid, "Client offline!", -1, time.Now().UTC())
@@ -157,8 +193,9 @@ func adminExec(ctx context.Context, req *rpc.JsonRpcRequest) (any, *rpc.JsonRpcE
 	}, nil
 }
 
-func adminTestSendMessage(_ context.Context, _ *rpc.JsonRpcRequest) (any, *rpc.JsonRpcError) {
-	if err := messageSender.SendNotification(models.EventMessage{
+func adminTestSendMessage(ctx context.Context, _ *rpc.JsonRpcRequest) (any, *rpc.JsonRpcError) {
+	actor, ip := auditActor(ctx)
+	if err := messageSender.SendNotificationWithActor(ip, actor, models.EventMessage{
 		Event:   "Test",
 		Time:    time.Now().UTC(),
 		Message: "This is a test message from Komari.",

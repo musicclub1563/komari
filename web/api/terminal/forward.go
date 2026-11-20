@@ -1,342 +1,236 @@
 package terminal
 
 import (
-	"encoding/json"
-	"errors"
-	"sync"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/komari-monitor/komari/database/auditlog"
 	"github.com/komari-monitor/komari/web/connection"
 )
 
-// errTerminalCredentialRevoked 表示建立终端时使用的凭据已被删除、过期或轮换。
-var errTerminalCredentialRevoked = errors.New("terminal credential revoked")
-
-// errForwardSuperseded 表示本轮转发已不再持有当前浏览器连接（被替换或挂起）。
-// 它只用于让本轮 goroutine 退出，清理时不得触碰新的会话连接。
-var errForwardSuperseded = errors.New("terminal forwarding superseded")
-
-const (
-	// terminalAgentCloseWriteWait 限制给 agent 发送关闭通知的单次写操作。
-	terminalAgentCloseWriteWait = time.Second
-	// terminalAgentCloseNotifyWait 限制撤权路径等待关闭通知的总时长。超时后
-	// 直接关闭 agent 连接，绝不阻塞浏览器断开。
-	terminalAgentCloseNotifyWait = time.Second
-)
-
-// ForwardTerminal 是保持向后兼容的入口；转发生命周期由 done 管理。
+// ForwardTerminal pumps frames between the browser and the agent until one of
+// them ends the session. An unexpected break suspends only the broken side and
+// tells the surviving one to wait for a reconnect; an explicit terminate closes
+// the whole session.
+//
+// Each SafeConn spawns at most one reader goroutine across its lifetime: if an
+// older peer ignores abort and stays connected across a reattach, its existing
+// reader simply starts forwarding to the newly attached peer instead of racing
+// a second concurrent ReadMessage on the same gorilla/websocket.Conn.
 func ForwardTerminal(id string, browser, agent *connection.SafeConn) {
-	generation := uint64(0)
-	TerminalSessionsMutex.Lock()
-	if session := TerminalSessions[id]; session != nil {
-		generation = session.generation
-	}
-	TerminalSessionsMutex.Unlock()
-	done := make(chan struct{})
-	go forwardTerminal(id, browser, agent, generation, done)
-}
-
-// forwardTerminal runs one forwarding round. A round is tied to a browser
-// connection (generation); replacing the agent does NOT restart the round:
-// both pumps resolve the session's current agent before every transfer, so a
-// replaced agent is picked up without a handoff window that could swallow the
-// browser's next input.
-func forwardTerminal(id string, browser, agent *connection.SafeConn, generation uint64, done chan struct{}) {
-	defer close(done)
-	defer clearForwarding(id, generation, done)
-	if browser == nil {
+	if browser == nil || agent == nil {
 		return
 	}
-
+	establishedTime := time.Now().UTC()
 	TerminalSessionsMutex.Lock()
 	session := TerminalSessions[id]
-	requesterIp, userUUID := "", ""
-	var credential *terminalCredential
-	valid := session != nil && session.Browser == browser && session.generation == generation
-	if valid {
-		requesterIp, userUUID = session.RequesterIp, session.UserUUID
-		credential = session.Credential
+	requesterIp, userUUID, clientUUID := "", "", ""
+	var (
+		stop         chan struct{}
+		prevDuration time.Duration
+		connects     int
+		startedAt    time.Time
+	)
+	startBrowser, startAgent := false, false
+	if session != nil && session.Browser == browser && session.Agent == agent {
+		requesterIp, userUUID, clientUUID = session.RequesterIp, session.UserUUID, session.UUID
+		stopForwardWaitLocked(session)
+		stop = make(chan struct{})
+		session.forwardStop = stop
+		session.activeForwarders++
+		session.auditConnects++
+		if session.auditStartedAt.IsZero() {
+			session.auditStartedAt = establishedTime
+		}
+		prevDuration = session.auditDuration
+		connects = session.auditConnects
+		startedAt = session.auditStartedAt
+		if session.browserPump != browser {
+			session.browserPump = browser
+			startBrowser = true
+		}
+		if session.agentPump != agent {
+			session.agentPump = agent
+			startAgent = true
+		}
 	}
 	TerminalSessionsMutex.Unlock()
-	if !valid || requesterIp == "" {
-		return
-	}
-	if credential == nil {
-		// 无法追溯授权来源的会话不允许转发（例如升级前建立的会话）。
-		suspendSession(id, browser, agent)
+	if requesterIp == "" {
 		return
 	}
 
-	auditlog.Log(requesterIp, userUUID, "established, terminal id:"+id, "terminal")
-	establishedTime := time.Now()
-	errChan := make(chan error, 1)
-	// stop 通知所有转发 goroutine 退出；done 在它们全部退出后才关闭。
-	stop := make(chan struct{})
-	var wg sync.WaitGroup
-	reportErr := func(err error) {
-		select {
-		case errChan <- err:
-		default:
-		}
+	session.auditMu.Lock()
+	if session.auditClient == "" && clientUUID != "" {
+		session.auditClient = auditlog.FormatClientUUID(clientUUID)
+	}
+	activeMsg := formatTerminalAuditMessage(terminalAuditSnapshot{
+		clientLabel: session.auditClient,
+		terminalID:  id,
+		status:      "active",
+		duration:    prevDuration,
+		connects:    connects,
+		startedAt:   startedAt,
+	})
+	if session.auditLogID == 0 {
+		session.auditLogID = auditlog.LogWithID(requesterIp, userUUID, activeMsg, "terminal")
+	} else {
+		auditlog.UpdateMessage(session.auditLogID, activeMsg)
+	}
+	session.auditMu.Unlock()
+
+	if startBrowser {
+		go pumpBrowserFrames(id, browser)
+	}
+	if startAgent {
+		go pumpAgentFrames(id, agent)
 	}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		browserPump(id, browser, generation, credential, stop, reportErr)
-	}()
+	<-stop
+	segmentDuration := time.Since(establishedTime)
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		agentPump(id, browser, generation, stop, reportErr)
-	}()
+	session.auditMu.Lock()
+	TerminalSessionsMutex.Lock()
+	session.auditDuration += segmentDuration
+	if session.activeForwarders > 0 {
+		session.activeForwarders--
+	}
+	remainingForwarders := session.activeForwarders
+	totalDuration := session.auditDuration
+	finalConnects := session.auditConnects
+	finalStarted := session.auditStartedAt
+	stillRetained := TerminalSessions[id] == session
+	endReason := session.auditEndReason
+	TerminalSessionsMutex.Unlock()
 
-	// 空闲连接也需要撤销：用户不再输入时，输出方向仍可能持续泄露，
-	// 因此周期复核凭据并在失效后主动关闭两端。
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ticker := time.NewTicker(terminalCredentialRecheckInterval())
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ticker.C:
-				if !credential.valid() {
-					reportErr(errTerminalCredentialRevoked)
-					return
-				}
+	// Only write a suspended/final update if no newer ForwardTerminal took over.
+	if session.auditLogID != 0 && remainingForwarders == 0 {
+		status := "suspended"
+		var endedAt time.Time
+		if !stillRetained {
+			status = endReason
+			if status == "" {
+				status = "closed"
 			}
+			endedAt = time.Now().UTC()
 		}
-	}()
-
-	fatalErr := <-errChan
-	close(stop)
-
-	if errors.Is(fatalErr, errTerminalCredentialRevoked) {
-		// 撤权：先删除会话并关闭浏览器（不依赖 agent 收到通知），再给 agent
-		// 一次有界的关闭通知，最后关闭 agent 连接。
-		revokedAgent := revokeRound(id, browser, generation)
-		if revokedAgent != nil {
-			notifyAgentClose(revokedAgent, terminalAgentCloseNotifyWait)
-			_ = revokedAgent.Close()
-		}
-	} else if !errors.Is(fatalErr, errForwardSuperseded) {
-		suspendRound(id, browser, generation)
+		auditlog.UpdateMessage(session.auditLogID, formatTerminalAuditMessage(terminalAuditSnapshot{
+			logID:       session.auditLogID,
+			clientLabel: session.auditClient,
+			terminalID:  id,
+			status:      status,
+			duration:    totalDuration,
+			connects:    finalConnects,
+			startedAt:   finalStarted,
+			endedAt:     endedAt,
+		}))
 	}
-
-	wg.Wait()
-	disconnectTime := time.Now()
-	auditlog.Log(requesterIp, userUUID, "disconnected, terminal id:"+id+", duration:"+disconnectTime.Sub(establishedTime).String(), "terminal")
+	session.auditMu.Unlock()
 }
 
-// browserPump reads browser input and writes it to the session's current
-// agent. Only one pump exists per browser connection, so an agent replacement
-// never creates a second reader that could consume (and lose) the next frame.
-func browserPump(
-	id string,
-	browser *connection.SafeConn,
-	generation uint64,
-	credential *terminalCredential,
-	stop <-chan struct{},
-	reportErr func(error),
-) {
-	for {
-		select {
-		case <-stop:
-			return
-		default:
-		}
+func currentAgentForBrowser(id string, browser *connection.SafeConn) (*connection.SafeConn, bool) {
+	TerminalSessionsMutex.Lock()
+	defer TerminalSessionsMutex.Unlock()
+	session := TerminalSessions[id]
+	if session == nil || session.Browser != browser {
+		return nil, false
+	}
+	return session.Agent, true
+}
 
+func currentBrowserForAgent(id string, agent *connection.SafeConn) (*connection.SafeConn, bool) {
+	TerminalSessionsMutex.Lock()
+	defer TerminalSessionsMutex.Unlock()
+	session := TerminalSessions[id]
+	if session == nil || session.Agent != agent {
+		return nil, false
+	}
+	return session.Browser, true
+}
+
+func pumpBrowserFrames(id string, browser *connection.SafeConn) {
+	// 每个浏览器连接只启动一个凭据复核协程：凭据被撤销时由它关闭整个会话。
+	go watchTerminalCredential(id, browser)
+	for {
 		messageType, data, err := browser.ReadMessage()
 		if err != nil {
-			reportErr(err)
+			suspendBrowser(id, browser)
 			return
 		}
-
-		// 取当前 agent：交接期间可能已经被替换。
-		TerminalSessionsMutex.Lock()
-		session, ok := TerminalSessions[id]
-		if !ok || session == nil || session.Browser != browser || session.generation != generation {
-			TerminalSessionsMutex.Unlock()
-			reportErr(errForwardSuperseded)
-			return
-		}
-		agent := session.Agent
-		TerminalSessionsMutex.Unlock()
-		if agent == nil {
-			reportErr(errForwardSuperseded)
-			return
-		}
-
-		// 输入转发前重新校验建立终端时使用的凭据：Session 删除/过期、
-		// API Key 轮换后立即停止，不能只依赖握手时的身份。
-		if !credential.valid() {
-			reportErr(errTerminalCredentialRevoked)
-			return
-		}
-
 		if messageType == websocket.TextMessage {
-			var control struct {
-				Type string `json:"type"`
-			}
-			if json.Unmarshal(data, &control) == nil {
-				if control.Type == "heartbeat" {
-					continue
-				}
-				if control.Type == "close" {
-					// 通知 agent 终止远端 PTY；有界等待，失败也继续本地清理。
-					notifyAgentClose(agent, terminalAgentCloseNotifyWait)
+			if control, ok := parseControl(data); ok {
+				switch control.Type {
+				case controlTypeTerminate, "close":
+					// 浏览器主动结束：closeSession 会把 terminate 转给被控端。
 					closeSession(id)
-					reportErr(nil)
 					return
 				}
-			}
-			if len(data) > 0 && data[0] == '{' {
-				err = agent.WriteMessage(websocket.TextMessage, data)
-			} else {
-				err = agent.WriteMessage(websocket.BinaryMessage, data)
-			}
-		} else {
-			err = agent.WriteMessage(websocket.BinaryMessage, data)
-		}
-
-		if err != nil {
-			reportErr(err)
-			return
-		}
-	}
-}
-
-// agentPump reads the session's current agent and writes output to the browser.
-// When the agent connection is replaced, the old read fails and this pump
-// switches to the new connection instead of ending the round.
-func agentPump(
-	id string,
-	browser *connection.SafeConn,
-	generation uint64,
-	stop <-chan struct{},
-	reportErr func(error),
-) {
-	for {
-		select {
-		case <-stop:
-			return
-		default:
-		}
-
-		TerminalSessionsMutex.Lock()
-		session, ok := TerminalSessions[id]
-		if !ok || session == nil || session.Browser != browser || session.generation != generation {
-			TerminalSessionsMutex.Unlock()
-			reportErr(errForwardSuperseded)
-			return
-		}
-		agent := session.Agent
-		TerminalSessionsMutex.Unlock()
-		if agent == nil {
-			reportErr(errForwardSuperseded)
-			return
-		}
-
-		_, data, err := agent.ReadMessage()
-		if err != nil {
-			// 判断出错的是否仍是当前 agent：被替换时继续读新连接，避免把
-			// 交接误判成会话结束。
-			TerminalSessionsMutex.Lock()
-			session, ok = TerminalSessions[id]
-			current := ok && session != nil && session.Browser == browser &&
-				session.generation == generation && session.Agent != nil && session.Agent != agent
-			TerminalSessionsMutex.Unlock()
-			if current {
+				agent, active := currentAgentForBrowser(id, browser)
+				if !active {
+					return
+				}
+				if agent == nil {
+					continue
+				}
+				// heartbeat / resize 等控制帧保持文本帧原样透传（保活并支持端到端 RTT，含旧版兼容）。
+				if err = agent.WriteMessage(websocket.TextMessage, data); err != nil {
+					suspendAgent(id, agent)
+				}
 				continue
 			}
-			reportErr(err)
+		}
+		agent, active := currentAgentForBrowser(id, browser)
+		if !active {
 			return
 		}
-		if err := browser.WriteMessage(websocket.BinaryMessage, data); err != nil {
-			reportErr(err)
-			return
+		if agent == nil {
+			continue
+		}
+		if err = agent.WriteMessage(websocket.BinaryMessage, data); err != nil {
+			suspendAgent(id, agent)
 		}
 	}
 }
 
-// suspendRound tears down the current connections of one browser generation.
-// A stale round (browser replaced) must not close the new session's agent.
-func suspendRound(id string, browser *connection.SafeConn, generation uint64) {
-	TerminalSessionsMutex.Lock()
-	session, ok := TerminalSessions[id]
-	if !ok || session == nil || session.Browser != browser || session.generation != generation {
-		TerminalSessionsMutex.Unlock()
-		return
+func pumpAgentFrames(id string, agent *connection.SafeConn) {
+	for {
+		messageType, data, err := agent.ReadMessage()
+		if err != nil {
+			suspendAgent(id, agent)
+			return
+		}
+		if messageType == websocket.TextMessage {
+			if control, ok := parseControl(data); ok {
+				switch control.Type {
+				case controlTypeTerminate:
+					// 被控端结束（shell 退出等）：closeSession 会转给浏览器。
+					closeSession(id)
+					return
+				case controlTypeHeartbeat:
+					browser, active := currentBrowserForAgent(id, agent)
+					if !active {
+						return
+					}
+					if browser != nil {
+						if err = browser.WriteMessage(websocket.TextMessage, data); err != nil {
+							suspendBrowser(id, browser)
+						}
+					}
+					continue
+				}
+				// 未知控制消息：忽略，前向兼容。
+				continue
+			}
+		}
+		browser, active := currentBrowserForAgent(id, agent)
+		if !active {
+			return
+		}
+		if browser == nil {
+			continue
+		}
+		// 非控制文本帧（如旧版 Agent 的文本报错）按原帧类型转发，其余走二进制。
+		if err = browser.WriteMessage(messageType, data); err != nil {
+			suspendBrowser(id, browser)
+		}
 	}
-	agent := session.Agent
-	session.Browser = nil
-	session.Agent = nil
-	session.Forwarding = false
-	scheduleCleanup(id, session)
-	TerminalSessionsMutex.Unlock()
-
-	_ = browser.Close()
-	if agent != nil {
-		_ = agent.Close()
-	}
-}
-
-// revokeRound removes the session permanently (so it cannot be reattached) and
-// closes the browser before returning the agent connection for a bounded close
-// notification.
-func revokeRound(id string, browser *connection.SafeConn, generation uint64) *connection.SafeConn {
-	TerminalSessionsMutex.Lock()
-	session, ok := TerminalSessions[id]
-	if !ok || session == nil || session.Browser != browser || session.generation != generation {
-		TerminalSessionsMutex.Unlock()
-		return nil
-	}
-	agent := session.Agent
-	stopCleanup(session)
-	session.Revoked = true
-	session.Browser = nil
-	session.Agent = nil
-	session.Forwarding = false
-	delete(TerminalSessions, id)
-	TerminalSessionsMutex.Unlock()
-
-	// 浏览器必须立即断开，不能等待 agent 接收关闭通知。
-	_ = browser.Close()
-	return agent
-}
-
-// notifyAgentClose asks the agent to terminate the remote PTY. It is bounded:
-// a stuck write (peer stopped reading) must not delay teardown. The caller
-// closes the agent connection afterwards, which unblocks the write.
-func notifyAgentClose(agent *connection.SafeConn, wait time.Duration) {
-	if agent == nil {
-		return
-	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_ = agent.WriteJSONWithDeadline(gin.H{"type": "close"}, time.Now().Add(terminalAgentCloseWriteWait))
-	}()
-	select {
-	case <-done:
-	case <-time.After(wait):
-	}
-}
-
-// clearForwarding releases the round-owned forwarding flag when this round is
-// still the current one.
-func clearForwarding(id string, generation uint64, done chan struct{}) {
-	TerminalSessionsMutex.Lock()
-	session, ok := TerminalSessions[id]
-	if ok && session != nil && session.generation == generation && session.forwardDone == done {
-		session.Forwarding = false
-	}
-	TerminalSessionsMutex.Unlock()
 }

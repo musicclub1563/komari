@@ -7,6 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/komari-monitor/komari/database/accounts"
+	"github.com/komari-monitor/komari/database/auditlog"
 	"github.com/komari-monitor/komari/utils"
 	"github.com/komari-monitor/komari/web/api"
 )
@@ -54,6 +55,7 @@ func Enable2FA(c *gin.Context) {
 	switch {
 	case err == nil:
 		c.SetCookie("2fa_secret", "", -1, "/", "", false, true)
+		auditlog.Log(c.ClientIP(), uuid, "2FA enabled: user="+auditlog.FormatUserUUID(uuid), "warn")
 		api.RespondSuccess(c, "2FA enabled successfully")
 	case errors.Is(err, accounts.ErrCurrentTwoFactorRequired),
 		errors.Is(err, accounts.ErrCurrentTwoFactorInvalid):
@@ -80,5 +82,6 @@ func Disable2FA(c *gin.Context) {
 		return
 	}
 	accounts.ClearPending2FA(uuid)
+	auditlog.Log(c.ClientIP(), uuid, "2FA disabled: user="+auditlog.FormatUserUUID(uuid), "warn")
 	api.RespondSuccess(c, "")
 }
