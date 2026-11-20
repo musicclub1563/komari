@@ -4,10 +4,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/komari-monitor/komari/database/dbcore"
 	"github.com/komari-monitor/komari/internal/config"
 )
 
 func TestTerminalCredentialAPIKeyRotation(t *testing.T) {
+	if err := dbcore.Initialize(); err != nil {
+		t.Fatalf("initialize database: %v", err)
+	}
 	original, _ := config.GetAs[string](config.ApiKeyKey, "")
 	if err := config.Set(config.ApiKeyKey, "key-1"); err != nil {
 		t.Fatalf("set api key: %v", err)
