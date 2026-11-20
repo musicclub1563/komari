@@ -57,8 +57,10 @@ runs:
         # falling back to the repository default branch.
         # radix head: svg icon XSS fix, HTML sanitisation, PWA cache of
         # authenticated responses removed, office preview consent, plugin
-        # settings layout fix, warning before deleting the active theme.
-        PINNED_REF: "0c1af822e1fe723ac9a8a384e293c6f3c0971f83"
+        # settings layout fix, warning before deleting the active theme,
+        # global animation redesign and the terminal/editor overhaul that
+        # followed it.
+        PINNED_REF: "d4e36bf8f750d765ad984e57e3e37587c3543b2b"
         INPUT_REF: ${{ inputs.ref }}
         REPO: ${{ inputs.repository }}
       run: |
