@@ -41,7 +41,7 @@ jobs:
           GOARCH: amd64
         run: |
           VERSION_SHA="${{ github.sha }}"
-          go build -ldflags "-s -w -extldflags=-Wl,--strip-all -X github.com/komari-monitor/komari/utils.CurrentVersion=dev -X github.com/komari-monitor/komari/utils.VersionHash=${VERSION_SHA}" -o komari .
+          go build -trimpath -tags "nomsgpack sqlite_omit_load_extension" -ldflags "-s -w -buildid= -extldflags=-Wl,--gc-sections,--strip-all -X github.com/komari-monitor/komari/utils.CurrentVersion=dev -X github.com/komari-monitor/komari/utils.VersionHash=${VERSION_SHA}" -o komari .
 
       - name: Save Go build cache
         if: steps.go-cache.outputs.build-cache-hit != 'true'
